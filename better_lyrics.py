@@ -1167,6 +1167,7 @@ def get_on_save(file: File) -> None:
 # ---------------------------------------------------------------------------
 class BetterLyricsGetAction(BaseAction):
     NAME = "Get lyrics (TTML / LRC) automatically with Better Lyrics"
+    TITLE = "Get lyrics (TTML / LRC) automatically with Better Lyrics"
 
     def execute_on_track(self, track: Track):
         if not track.linked_files and not track.files:
@@ -1185,6 +1186,7 @@ class BetterLyricsGetAction(BaseAction):
 
 class BetterLyricsSearchAction(BaseAction):
     NAME = "Search lyrics (TTML / LRC) manually with Better Lyrics"
+    TITLE = "Search lyrics (TTML / LRC) manually with Better Lyrics"
 
     def execute_on_track(self, track: Track):
         files = track.files or list(track.linked_files)
@@ -1441,15 +1443,24 @@ class BetterLyricsOptionsPage(OptionsPage):
 
 
 # ---------------------------------------------------------------------------
-# Plugin Registration
+# Plugin Registration (Legacy v2 / Standalone single-file loader)
 # ---------------------------------------------------------------------------
-register_file_post_addition_to_track_processor(get_on_load)
-register_file_post_save_processor(get_on_save)
+def _register_v2():
+    try:
+        register_file_post_addition_to_track_processor(get_on_load)
+        register_file_post_save_processor(get_on_save)
 
-register_track_action(BetterLyricsSearchAction())
-register_album_action(BetterLyricsSearchAction())
+        register_track_action(BetterLyricsSearchAction())
+        register_album_action(BetterLyricsSearchAction())
 
-register_track_action(BetterLyricsGetAction())
-register_album_action(BetterLyricsGetAction())
+        register_track_action(BetterLyricsGetAction())
+        register_album_action(BetterLyricsGetAction())
 
-register_options_page(BetterLyricsOptionsPage)
+        register_options_page(BetterLyricsOptionsPage)
+    except Exception as e:
+        log.debug(f"{PLUGIN_NAME}: V2 auto-registration skipped: {e}")
+
+
+# Only auto-register if loaded as a standalone file, not imported as a package
+if __name__ in ("__main__", "better_lyrics"):
+    _register_v2()

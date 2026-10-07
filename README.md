@@ -24,22 +24,34 @@ Compatible with both **Picard 3.0+ (PyQt6)** and **Picard 2.x (PyQt5)**.
 
 ## Installation
 
+### Method 1: Install from URL (Picard 3.0+ Recommended)
+
+1. In MusicBrainz Picard, open **Options -> Plugins**.
+2. Click **Install from URL...** (or the URL install button).
+3. Enter the repository URL:
+   ```
+   https://github.com/zoltrons/betterlyrics-picard
+   ```
+4. Click **Install**. Picard will clone the repository, read `MANIFEST.toml`, and enable the plugin.
+
+### Method 2: Manual Installation (Picard 2.x & 3.0)
+
 Download [`better_lyrics.py`](better_lyrics.py) and place it into your Picard plugins directory:
 
-### macOS
+#### macOS
 ```bash
 mkdir -p ~/Library/Preferences/MusicBrainz/Picard/plugins
 cp better_lyrics.py ~/Library/Preferences/MusicBrainz/Picard/plugins/
 ```
 
-### Windows
+#### Windows
 Copy `better_lyrics.py` to:
 ```
 %APPDATA%\MusicBrainz\Picard\plugins\
 ```
 *(e.g., `C:\Users\<Username>\AppData\Roaming\MusicBrainz\Picard\plugins\`)*
 
-### Linux
+#### Linux
 ```bash
 mkdir -p ~/.config/MusicBrainz/Picard/plugins
 cp better_lyrics.py ~/.config/MusicBrainz/Picard/plugins/
