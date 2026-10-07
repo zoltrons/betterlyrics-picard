@@ -151,14 +151,19 @@ class ConfigProxy:
 
     def get(self, key: str, default=None):
         api = get_plugin_api()
-        if api and hasattr(api, "plugin_config"):
+        if api is not None and hasattr(api, "plugin_config"):
             try:
-                val = api.plugin_config.get(key)
-                if val is not None and val != "":
-                    return val
+                # Picard's ConfigSection has no .get(); use item access, which
+                # returns the persisted value or the registered default.
+                value = api.plugin_config[key]
+                if value is not None:
+                    return value
             except Exception:
                 pass
-        return PLUGIN_OPTIONS.get(key, default)
+        fallback = PLUGIN_OPTIONS.get(key)
+        if fallback is not None:
+            return fallback
+        return default
 
     def __getitem__(self, key: str):
         return self.get(key, PLUGIN_OPTIONS.get(key))
@@ -181,7 +186,7 @@ def _config_int(api: PluginApi | None, key: str, default: int) -> int:
     value = None
     if api is not None and hasattr(api, "plugin_config"):
         try:
-            value = api.plugin_config.get(key)
+            value = api.plugin_config[key]  # ConfigSection item access, not .get()
         except Exception:
             value = None
     if value is None or value == "":
@@ -2013,8 +2018,9 @@ class BetterLyricsOptionsPage(OptionsPage):
         self.box.addStretch()
 
     def load(self):
-        api = getattr(self, "api", None) or get_plugin_api()
-        cfg = api.plugin_config if api else {}
+        # ``config`` reads through api.plugin_config using item access
+        # (ConfigSection has no ``.get()``) and falls back to registered defaults.
+        cfg = config
 
         self.get_on_load.setChecked(bool(cfg.get("betterlyrics_get_on_load", True)))
         self.get_on_save.setChecked(bool(cfg.get("betterlyrics_get_on_save", False)))
@@ -2047,10 +2053,9 @@ class BetterLyricsOptionsPage(OptionsPage):
         self.rate_spin.setValue(int(cfg.get("betterlyrics_rate_limit_ms", 200)))
 
     def save(self):
-        api = getattr(self, "api", None) or get_plugin_api()
-        if not api:
-            return
-        cfg = api.plugin_config
+        # ``config`` writes through to api.plugin_config (persisted) and the
+        # local defaults, so changes take effect immediately.
+        cfg = config
 
         cfg["betterlyrics_get_on_load"] = self.get_on_load.isChecked()
         cfg["betterlyrics_get_on_save"] = self.get_on_save.isChecked()
