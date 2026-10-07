@@ -10,8 +10,7 @@ Features:
 - Native TTML support (embedded in tags and saved as .ttml sidecar)
 - Standard and enhanced LRC support with word-sync cleaning
 - Smart matching with duration tolerance, title/artist similarity, and ISRC
-- Interactive search dialog with dual TTML/LRC preview
-- Compatible with Picard 3.0+ (PyQt6) and Picard 2.x (PyQt5)
+- Built for Picard 3.0+ Plugin v3 architecture (PyQt6)
 """
 api = ["3.0", "3.1"]
 license = "MIT"

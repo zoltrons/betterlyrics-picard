@@ -2,7 +2,7 @@
 
 A [MusicBrainz Picard](https://picard.musicbrainz.org/) plugin that fetches synchronized **TTML** (Timed Text Markup Language) and **LRC** lyrics from the [Better Lyrics](https://github.com/better-lyrics/better-lyrics) ecosystem ([LRC.red](https://lrc.red) and [Unison](https://unison.betterlyrics.org)).
 
-Compatible with both **Picard 3.0+ (PyQt6)** and **Picard 2.x (PyQt5)**.
+Designed for **MusicBrainz Picard 3.0+** using the modern **Plugin v3** architecture and **PyQt6**.
 
 ---
 
@@ -17,47 +17,43 @@ Compatible with both **Picard 3.0+ (PyQt6)** and **Picard 2.x (PyQt5)**.
   - **Better Lyrics API**: Optional support for custom API keys.
 - **Smart Match Scoring**: Ranks results using title and artist fuzzy matching (`SequenceMatcher`), album identity, duration tolerance (default ±4s), and exact MusicBrainz ISRC matching.
 - **Interactive Search Dialog**: Right-click any track or album to search manually, view results in a detailed table (title, artist, album, duration, sync type, source), and inspect lyrics with side-by-side TTML/LRC preview before applying.
-- **Automation Hooks**: Optional automatic search and retrieval when loading tracks into Picard or when saving files.
+- **Automation Hooks**: Automatic search and retrieval when loading tracks into Picard or when saving files.
 - **Library Maintenance**: Built-in tool to scan your music directory and clean up orphaned `.ttml` and `.lrc` files whose audio counterparts have been removed.
 
 ---
 
 ## Installation
 
-### Method 1: Install from URL (Picard 3.0+ Recommended)
+### Option 1: Install from Git URL (Recommended)
 
-1. In MusicBrainz Picard, open **Options -> Plugins**.
-2. Click **Install from URL...** (or the URL install button).
+1. In MusicBrainz Picard 3.0, open **Options -> Plugins**.
+2. Click **Install from URL...**
 3. Enter the repository URL:
    ```
    https://github.com/zoltrons/betterlyrics-picard
    ```
 4. Click **Install**. Picard will clone the repository, read `MANIFEST.toml`, and enable the plugin.
 
-### Method 2: Manual Installation (Picard 2.x & 3.0)
+### Option 2: Clone directly into plugins directory
 
-Download [`better_lyrics.py`](better_lyrics.py) and place it into your Picard plugins directory:
+Clone this repository into Picard's plugin directory:
 
 #### macOS
 ```bash
-mkdir -p ~/Library/Preferences/MusicBrainz/Picard/plugins
-cp better_lyrics.py ~/Library/Preferences/MusicBrainz/Picard/plugins/
+git clone https://github.com/zoltrons/betterlyrics-picard.git ~/Library/Preferences/MusicBrainz/Picard/plugins/betterlyrics-picard
 ```
 
-#### Windows
-Copy `better_lyrics.py` to:
+#### Windows (PowerShell)
+```powershell
+git clone https://github.com/zoltrons/betterlyrics-picard.git "$env:APPDATA\MusicBrainz\Picard\plugins\betterlyrics-picard"
 ```
-%APPDATA%\MusicBrainz\Picard\plugins\
-```
-*(e.g., `C:\Users\<Username>\AppData\Roaming\MusicBrainz\Picard\plugins\`)*
 
 #### Linux
 ```bash
-mkdir -p ~/.config/MusicBrainz/Picard/plugins
-cp better_lyrics.py ~/.config/MusicBrainz/Picard/plugins/
+git clone https://github.com/zoltrons/betterlyrics-picard.git ~/.config/MusicBrainz/Picard/plugins/betterlyrics-picard
 ```
 
-After placing the file, open Picard, navigate to **Options -> Plugins**, and enable **Better Lyrics**.
+Restart or reload Picard, open **Options -> Plugins**, and ensure **Better Lyrics** is enabled.
 
 ---
 
