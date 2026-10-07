@@ -8,11 +8,16 @@
 # Designed specifically for MusicBrainz Picard 3.0 Plugin v3 Architecture.
 #
 
+from collections import OrderedDict
 from functools import partial
 import json
 import os
+import queue
+import random
 import re
 import ssl
+import threading
+import time
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
@@ -58,6 +63,9 @@ PLUGIN_OPTIONS = {
     "betterlyrics_source": "all",  # "all", "lrcred", "unison"
     "betterlyrics_duration_tolerance": 5,  # seconds
     "betterlyrics_api_key": "",
+    # Stability / anti-abuse tuning (background fetch queue)
+    "betterlyrics_max_workers": 3,  # concurrent background fetch jobs
+    "betterlyrics_rate_limit_ms": 200,  # min delay between outbound HTTP requests
 }
 
 # Service URLs
@@ -68,7 +76,7 @@ BETTER_LYRICS_API_URL = "https://api.betterlyrics.org/getLyrics"
 
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36 MusicBrainzPicard-BetterLyrics/1.1"
+    "Chrome/131.0.0.0 Safari/537.36 MusicBrainzPicard-BetterLyrics/1.2"
 )
 
 # PyQt6 Layout & View Alignment Constants
@@ -166,6 +174,37 @@ class ConfigProxy:
 
 
 config = ConfigProxy()
+
+
+def _config_int(api: PluginApi | None, key: str, default: int) -> int:
+    """Reads an integer plugin option defensively from ``api.plugin_config``."""
+    value = None
+    if api is not None and hasattr(api, "plugin_config"):
+        try:
+            value = api.plugin_config.get(key)
+        except Exception:
+            value = None
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _ensure_queue_ready() -> None:
+    """Lazily (idempotently) starts the background fetch queue.
+
+    Called from the GUI thread on the automatic paths, guaranteeing that a
+    submitted job always has workers and a main-thread invoker available.
+    """
+    global _MAIN_INVOKER
+    _init_caches()
+    if _MAIN_INVOKER is None:
+        _MAIN_INVOKER = MainThreadInvoker()
+    FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
+    if not FETCH_QUEUE.is_running:
+        FETCH_QUEUE.start()
 
 
 # ---------------------------------------------------------------------------
@@ -374,6 +413,123 @@ def is_lrc_synced(lrc_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Concurrency Primitives: Rate Limiter, TTL Cache & Queue Globals
+# ---------------------------------------------------------------------------
+# Sentinel used to distinguish a genuine cache miss from a cached ``None``.
+_CACHE_MISS = object()
+
+# Retry policy for transient HTTP failures (429 / 5xx / connection errors).
+HTTP_RETRIES = 2
+RETRY_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+_BACKOFF_BASE = 0.5  # seconds
+_BACKOFF_MAX = 4.0  # seconds cap
+_NEGATIVE_CACHE_TTL = 30.0  # seconds to remember a failed lookup (anti-hammering)
+
+# Response caches (TTL, bounded LRU). One for raw text, one for parsed JSON.
+_HTTP_TEXT_CACHE = None  # initialised in _init_caches() to avoid import-time work
+_JSON_CACHE = None
+
+# Global outbound-request pacer, shared by worker threads and the main thread.
+_RATE_LIMITER = None
+
+# Foreground/background fetch queue (created lazily, started from ``enable``).
+FETCH_QUEUE = None
+
+# Main-thread dispatcher used by worker threads to apply results safely.
+_MAIN_INVOKER = None
+
+
+class RateLimiter:
+    """Thread-safe minimum-interval limiter that paces outbound requests.
+
+    Only one caller is ever allowed to pass per ``min_interval`` window, so the
+    plugin can never burst-hammer an API regardless of how many jobs run in
+    parallel.  Callers block briefly instead of failing.
+    """
+
+    def __init__(self, min_interval: float = 0.0):
+        self._min_interval = max(0.0, float(min_interval))
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def set_interval(self, min_interval: float) -> None:
+        with self._lock:
+            self._min_interval = max(0.0, float(min_interval))
+
+    @property
+    def interval(self) -> float:
+        return self._min_interval
+
+    def acquire(self) -> None:
+        """Blocks until the next request slot is available, then claims it."""
+        if self._min_interval <= 0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            wait = self._next_allowed - now
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            self._next_allowed = now + self._min_interval
+
+
+class TTLCache:
+    """Small thread-safe LRU cache with per-entry time-to-live.
+
+    Values may legitimately be ``None`` (negative caching); use :meth:`get`
+    together with the ``_CACHE_MISS`` sentinel to tell a miss from a cached
+    ``None``.
+    """
+
+    def __init__(self, max_entries: int = 512, ttl: float = 1800.0):
+        self._lock = threading.Lock()
+        self._store: "OrderedDict[object, tuple]" = OrderedDict()
+        self._max_entries = max(1, int(max_entries))
+        self._ttl = float(ttl)
+
+    def get(self, key, default=None):
+        with self._lock:
+            item = self._store.get(key)
+            if item is None:
+                return default
+            value, expires = item
+            if expires < time.monotonic():
+                self._store.pop(key, None)
+                return default
+            self._store.move_to_end(key)
+            return value
+
+    def set(self, key, value, ttl: float | None = None) -> None:
+        expiry = time.monotonic() + (self._ttl if ttl is None else float(ttl))
+        with self._lock:
+            self._store[key] = (value, expiry)
+            self._store.move_to_end(key)
+            while len(self._store) > self._max_entries:
+                self._store.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._store.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._store)
+
+
+def _init_caches() -> None:
+    """Creates the module-level caches/limiter/queue singletons exactly once."""
+    global _HTTP_TEXT_CACHE, _JSON_CACHE, _RATE_LIMITER, FETCH_QUEUE
+    if _HTTP_TEXT_CACHE is None:
+        _HTTP_TEXT_CACHE = TTLCache(max_entries=256, ttl=1800.0)
+    if _JSON_CACHE is None:
+        _JSON_CACHE = TTLCache(max_entries=512, ttl=900.0)
+    if _RATE_LIMITER is None:
+        _RATE_LIMITER = RateLimiter(0.2)
+    if FETCH_QUEUE is None:
+        FETCH_QUEUE = FetchQueue()
+
+
+# ---------------------------------------------------------------------------
 # HTTP Networking Helpers with SSL Fallback
 # ---------------------------------------------------------------------------
 def _get_ssl_context():
@@ -384,58 +540,275 @@ def _get_ssl_context():
         return ssl._create_unverified_context()
 
 
-def fetch_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 10):
-    """Performs a synchronous HTTP GET request and parses the JSON response."""
+def _build_url(url: str, params: dict | None) -> str:
+    """Appends query parameters to a URL when present."""
+    if not params:
+        return url
+    query = urlencode(params)
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}{query}"
+
+
+def _http_get(req, timeout: int):
+    """Performs a single HTTP GET. Returns (status, body); raises on network error."""
     try:
-        full_url = url
-        if params:
-            query = urlencode(params)
-            sep = "&" if "?" in url else "?"
-            full_url = f"{url}{sep}{query}"
+        resp = urlopen(req, timeout=timeout, context=_get_ssl_context())
+    except Exception:
+        # Retry once with an unverified context to tolerate missing CA bundles.
+        resp = urlopen(req, timeout=timeout, context=ssl._create_unverified_context())
+    with resp:
+        return resp.status, resp.read().decode("utf-8", errors="replace")
 
-        req_headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
-        if headers:
-            req_headers.update(headers)
 
-        req = Request(full_url, headers=req_headers)
+def _http_get_with_retry(req, timeout: int, retries: int = HTTP_RETRIES) -> str | None:
+    """Throttled HTTP GET with exponential backoff for transient failures.
 
+    Every outbound attempt first passes through the shared :class:`RateLimiter`,
+    so parallel workers never burst-hammer an API. Transient failures
+    (connection errors, 429 and 5xx responses) are retried with jittered
+    exponential backoff. Returns the body on success, else ``None``.
+    """
+    _init_caches()
+    last_error = None
+    last_status = None
+
+    for attempt in range(retries + 1):
+        _RATE_LIMITER.acquire()
         try:
-            ctx = _get_ssl_context()
-            resp = urlopen(req, timeout=timeout, context=ctx)
-        except Exception:
-            unverified_ctx = ssl._create_unverified_context()
-            resp = urlopen(req, timeout=timeout, context=unverified_ctx)
+            status, body = _http_get(req, timeout)
+        except Exception as e:
+            last_error = e
+            status = None
+        else:
+            last_error = None
+            if status == 200:
+                return body
+            last_status = status
 
-        with resp:
-            if resp.status != 200:
-                log.warning(f"{PLUGIN_NAME}: HTTP {resp.status} for {full_url}")
-                return None
-            body = resp.read().decode("utf-8", errors="replace")
-            return json.loads(body)
-    except Exception as e:
-        log.warning(f"{PLUGIN_NAME}: fetch_json error for {url}: {e}")
-        return None
+        retryable = status is None or status in RETRY_STATUS_CODES
+        if not retryable or attempt >= retries:
+            break
+
+        delay = min(_BACKOFF_MAX, _BACKOFF_BASE * (2 ** attempt)) + random.uniform(0.0, 0.25)
+        log.debug(
+            f"{PLUGIN_NAME}: retrying {req.full_url} after "
+            f"{'network error' if status is None else f'HTTP {status}'} "
+            f"(attempt {attempt + 1}/{retries}, waiting {delay:.2f}s)"
+        )
+        time.sleep(delay)
+
+    if last_error is not None:
+        log.warning(f"{PLUGIN_NAME}: request failed for {req.full_url}: {last_error}")
+    elif last_status is not None and last_status != 200:
+        log.warning(f"{PLUGIN_NAME}: HTTP {last_status} for {req.full_url}")
+    return None
 
 
-def fetch_text(url: str, timeout: int = 10) -> str | None:
-    """Performs a synchronous HTTP GET request and returns raw string response."""
-    try:
-        req = Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
+def fetch_json(
+    url: str,
+    params: dict | None = None,
+    headers: dict | None = None,
+    timeout: int = 10,
+    use_cache: bool = True,
+):
+    """Throttled, cached, retrying HTTP GET that parses a JSON response.
+
+    Successful responses are cached for 15 minutes; failures are cached briefly
+    (negative caching) so a broken endpoint is not hammered.
+    """
+    _init_caches()
+    full_url = _build_url(url, params)
+
+    if use_cache:
+        cached = _JSON_CACHE.get(full_url, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached
+
+    req_headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
+    if headers:
+        req_headers.update(headers)
+
+    body = _http_get_with_retry(Request(full_url, headers=req_headers), timeout)
+
+    data = None
+    if body is not None:
         try:
-            ctx = _get_ssl_context()
-            resp = urlopen(req, timeout=timeout, context=ctx)
-        except Exception:
-            unverified_ctx = ssl._create_unverified_context()
-            resp = urlopen(req, timeout=timeout, context=unverified_ctx)
+            data = json.loads(body)
+        except Exception as e:
+            log.warning(f"{PLUGIN_NAME}: invalid JSON from {full_url}: {e}")
+            data = None
 
-        with resp:
-            if resp.status != 200:
-                log.warning(f"{PLUGIN_NAME}: HTTP {resp.status} for {url}")
-                return None
-            return resp.read().decode("utf-8", errors="replace")
-    except Exception as e:
-        log.warning(f"{PLUGIN_NAME}: fetch_text error for {url}: {e}")
-        return None
+    if use_cache:
+        ttl = None if data is not None else _NEGATIVE_CACHE_TTL
+        _JSON_CACHE.set(full_url, data, ttl=ttl)
+    return data
+
+
+def fetch_text(
+    url: str,
+    timeout: int = 10,
+    use_cache: bool = True,
+    cache_ttl: float | None = None,
+) -> str | None:
+    """Throttled, cached, retrying HTTP GET returning the raw text response."""
+    _init_caches()
+
+    if use_cache:
+        cached = _HTTP_TEXT_CACHE.get(url, _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached
+
+    body = _http_get_with_retry(Request(url, headers={"User-Agent": DEFAULT_USER_AGENT}), timeout)
+
+    if use_cache:
+        ttl = cache_ttl if body is not None else _NEGATIVE_CACHE_TTL
+        _HTTP_TEXT_CACHE.set(url, body, ttl=ttl)
+    return body
+
+
+# ---------------------------------------------------------------------------
+# Main-Thread Bridge & Background Fetch Queue (stability + anti-abuse)
+# ---------------------------------------------------------------------------
+class MainThreadInvoker(QtCore.QObject):
+    """Marshals callables from worker threads onto the Qt main thread.
+
+    A queued signal/slot connection guarantees the slot runs in the thread that
+    owns this object (the GUI thread), where Picard's data model (tracks, files,
+    metadata) must be mutated.
+    """
+
+    _invoke = QtCore.pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+        self._invoke.connect(self._run, Qt.ConnectionType.QueuedConnection)
+
+    def _run(self, fn):
+        try:
+            fn()
+        except Exception as e:
+            log.error(f"{PLUGIN_NAME}: error applying queued result: {e}", exc_info=True)
+
+    def post(self, fn) -> None:
+        self._invoke.emit(fn)
+
+
+class _FetchTask:
+    """A unit of background work: a producer (``job_fn``) and a main-thread consumer."""
+
+    __slots__ = ("job_fn", "apply_fn", "key")
+
+    def __init__(self, job_fn, apply_fn, key):
+        self.job_fn = job_fn
+        self.apply_fn = apply_fn
+        self.key = key
+
+
+class FetchQueue:
+    """A bounded worker pool that moves lyrics fetching off the UI thread.
+
+    Stability & anti-abuse features:
+      * a configurable, bounded worker pool instead of an unbounded burst,
+      * deduplication of identical in-flight jobs (``key``),
+      * graceful start/stop,
+      * results delivered back to the GUI thread via :class:`MainThreadInvoker`.
+    """
+
+    def __init__(self, max_workers: int = 3):
+        self._max_workers = max(1, int(max_workers))
+        self._queue: "queue.Queue" = queue.Queue()
+        self._workers: list = []
+        self._lock = threading.Lock()
+        self._pending_keys: set = set()
+        self._running = False
+        self._invoker = None
+
+    def configure(self, max_workers: int | None = None) -> None:
+        if max_workers is not None:
+            self._max_workers = max(1, int(max_workers))
+
+    def set_invoker(self, invoker) -> None:
+        self._invoker = invoker
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._running
+
+    @property
+    def pending(self) -> int:
+        """Approximate number of queued (not yet started) jobs."""
+        return self._queue.qsize()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._running:
+                return
+            self._running = True
+            self._workers = [
+                threading.Thread(
+                    target=self._worker_loop,
+                    name=f"BetterLyricsFetch-{i}",
+                    daemon=True,
+                )
+                for i in range(self._max_workers)
+            ]
+        for worker in self._workers:
+            worker.start()
+        log.debug(f"{PLUGIN_NAME}: fetch queue started ({self._max_workers} worker(s))")
+
+    def stop(self) -> None:
+        """Signals workers to drain the queue and exit, then joins them."""
+        with self._lock:
+            if not self._running:
+                return
+            self._running = False
+            workers = list(self._workers)
+            self._workers = []
+        for _ in workers:
+            self._queue.put(None)  # poison pill enqueued after pending work
+        for worker in workers:
+            worker.join(timeout=5.0)
+        with self._lock:
+            self._pending_keys.clear()
+        log.debug(f"{PLUGIN_NAME}: fetch queue stopped")
+
+    def submit(self, job_fn, apply_fn=None, key=None) -> bool:
+        """Enqueues a job. Returns ``False`` if an identical job is already pending."""
+        if key is not None:
+            with self._lock:
+                if key in self._pending_keys:
+                    return False
+                self._pending_keys.add(key)
+        self._queue.put(_FetchTask(job_fn, apply_fn, key))
+        return True
+
+    def _release_key(self, key) -> None:
+        if key is None:
+            return
+        with self._lock:
+            self._pending_keys.discard(key)
+
+    def _worker_loop(self) -> None:
+        while True:
+            task = self._queue.get()
+            try:
+                if task is None:
+                    return
+                try:
+                    result = task.job_fn()
+                except Exception as e:
+                    log.warning(f"{PLUGIN_NAME}: background fetch job failed: {e}")
+                    result = None
+                if task.apply_fn is not None:
+                    invoker = self._invoker
+                    if invoker is not None:
+                        invoker.post(partial(task.apply_fn, result))
+                    else:
+                        log.debug(f"{PLUGIN_NAME}: no main-thread invoker; result dropped")
+            finally:
+                self._release_key(getattr(task, "key", None))
+                self._queue.task_done()
 
 
 # ---------------------------------------------------------------------------
@@ -633,8 +1006,12 @@ def query_all_sources(
     return results
 
 
-def resolve_lyrics_bundle(candidate: dict) -> dict:
-    """Downloads and prepares both TTML and LRC representations for a chosen candidate."""
+def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> dict:
+    """Downloads and prepares both TTML and LRC representations for a chosen candidate.
+
+    ``clean_words`` lets background workers pass a config snapshot instead of
+    reading plugin config from a non-GUI thread.
+    """
     source = candidate.get("source", "")
     raw_content = None
 
@@ -662,7 +1039,8 @@ def resolve_lyrics_bundle(candidate: dict) -> dict:
     if not raw_content:
         return {"ttml": None, "lrc": None, "is_synced": False, "source": source}
 
-    clean_words = config["betterlyrics_clean_word_timestamps"]
+    if clean_words is None:
+        clean_words = config["betterlyrics_clean_word_timestamps"]
 
     if is_ttml_content(raw_content):
         ttml_str = raw_content
@@ -1015,14 +1393,8 @@ def show_search_dialog(
 # ---------------------------------------------------------------------------
 # Core Lyrics Matcher & Fetcher
 # ---------------------------------------------------------------------------
-def fetch_and_apply_lyrics(
-    method: str,
-    track: Track | None,
-    files: list[File],
-    metadata: Metadata,
-    interactive: bool = False,
-):
-    """Main entry point for finding, scoring, and saving TTML/LRC lyrics for a track."""
+def _extract_track_query(metadata, track) -> tuple[str, str, str, str, int]:
+    """Reads (title, artist, album, isrc, length) from Picard metadata/track."""
     title = str(metadata.get("title", "") or "").strip()
     artist = str(metadata.get("artist", "") or "").strip()
     album_name = str(metadata.get("album", "") or "").strip()
@@ -1033,22 +1405,114 @@ def fetch_and_apply_lyrics(
         length = parse_duration(str(metadata["~length"]))
     elif track:
         length = get_track_duration(track)
+    return title, artist, album_name, isrc, length
+
+
+def _dedup_key(track, files, method):
+    """Builds a key so identical in-flight jobs are not queued twice."""
+    if track is not None:
+        return (method, "track", id(track))
+    if files:
+        names = tuple(sorted(str(getattr(f, "filename", "")) for f in files))
+        return (method, "files", names)
+    return None
+
+
+def _find_best_bundle(
+    title: str,
+    artist: str,
+    album_name: str,
+    length: int,
+    isrc: str,
+    source_pref: str,
+    clean_words: bool,
+    tolerance: int,
+) -> dict | None:
+    """Worker-thread body: query providers, pick the best match, resolve lyrics.
+
+    Pure network work only - never touches Qt/Picard objects, so it is safe to
+    run off the GUI thread.
+    """
+    try:
+        candidates = query_all_sources(
+            title=title,
+            artist=artist,
+            album=album_name,
+            duration=length,
+            isrc=isrc,
+            source_preference=source_pref,
+        )
+    except Exception as e:
+        log.warning(f"{PLUGIN_NAME}: search failed for \"{title}\": {e}")
+        return None
+
+    if not candidates:
+        return None
+
+    best = candidates[0]
+    if length > 0 and best.get("duration", 0) > 0:
+        diff = abs(length - best["duration"])
+        # If duration mismatch is large and title/artist score is weak, skip.
+        if diff > (tolerance + 5) and best.get("score", 0.0) < 0.50:
+            log.warning(
+                f"{PLUGIN_NAME}: Best match \"{best.get('title')}\" duration difference "
+                f"({diff}s) exceeds tolerance ({tolerance}s) with low score "
+                f"({best.get('score', 0):.2f})"
+            )
+            return None
+
+    try:
+        bundle = resolve_lyrics_bundle(best, clean_words=clean_words)
+    except Exception as e:
+        log.warning(f"{PLUGIN_NAME}: failed to resolve lyrics for \"{title}\": {e}")
+        return None
+
+    if not bundle.get("ttml") and not bundle.get("lrc"):
+        return None
+    return bundle
+
+
+def _apply_auto_bundle(title: str, files, track, bundle: dict | None) -> None:
+    """Main-thread consumer: writes a resolved bundle into Picard's data model."""
+    if not bundle:
+        log.warning(f"{PLUGIN_NAME}: No lyrics found for \"{title}\"")
+        return
+    try:
+        saved = save_lyrics_to_files(files, bundle, track=track, interactive=False)
+        if saved:
+            log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
+    except Exception as e:
+        log.error(f"{PLUGIN_NAME}: Failed to apply lyrics for \"{title}\": {e}", exc_info=True)
+
+
+def fetch_and_apply_lyrics(
+    method: str,
+    track: Track | None,
+    files: list[File],
+    metadata: Metadata,
+    interactive: bool = False,
+):
+    """Main entry point for finding, scoring, and saving TTML/LRC lyrics.
+
+    ``method == "search"`` runs synchronously on the GUI thread (it drives a
+    modal dialog). All automatic paths (``"get"``/``"load"``/``"save"``) are
+    handed to the background :class:`FetchQueue`, keeping the UI responsive and
+    pacing outbound requests.
+    """
+    title, artist, album_name, isrc, length = _extract_track_query(metadata, track)
 
     if not title:
         log.warning(f"{PLUGIN_NAME}: Cannot fetch lyrics without a track title")
         return
 
-    # Check instrumental
     if config["betterlyrics_ignore_instrumental"]:
         if "(instrumental)" in title.lower() or "[instrumental]" in title.lower():
             log.info(f"{PLUGIN_NAME}: Skipping instrumental track: {title}")
             return
 
-    log.info(f"{PLUGIN_NAME}: Searching lyrics for \"{title}\" by \"{artist}\" ({format_duration(length)})")
-
-    selected_candidate = None
-
     if method == "search":
+        # Interactive flow: the modal dialog must run on the GUI thread.
+        log.info(f"{PLUGIN_NAME}: Searching lyrics for \"{title}\" by \"{artist}\" ({format_duration(length)})")
         candidates = query_all_sources(
             title=title,
             artist=artist,
@@ -1064,46 +1528,34 @@ def fetch_and_apply_lyrics(
         if not selected_candidate:
             log.info(f"{PLUGIN_NAME}: User cancelled lyrics selection")
             return
-    else:
-        candidates = query_all_sources(
-            title=title,
-            artist=artist,
-            album=album_name,
-            duration=length,
-            isrc=isrc,
-            source_preference=config["betterlyrics_source"],
-        )
-        if not candidates:
-            log.warning(f"{PLUGIN_NAME}: No lyrics found for \"{title}\" by \"{artist}\"")
+
+        bundle = resolve_lyrics_bundle(selected_candidate)
+        if not bundle.get("ttml") and not bundle.get("lrc"):
+            log.warning(f"{PLUGIN_NAME}: Empty lyrics received for \"{title}\"")
             return
-
-        best = candidates[0]
-        tolerance = int(config["betterlyrics_duration_tolerance"])
-
-        if length > 0 and best.get("duration", 0) > 0:
-            diff = abs(length - best["duration"])
-            # If duration mismatch is large and title/artist score is weak, skip
-            if diff > (tolerance + 5) and best.get("score", 0.0) < 0.50:
-                log.warning(
-                    f"{PLUGIN_NAME}: Best match \"{best.get('title')}\" duration difference "
-                    f"({diff}s) exceeds tolerance ({tolerance}s) with low score ({best.get('score', 0):.2f})"
-                )
-                return
-
-        selected_candidate = best
-
-    if not selected_candidate:
+        save_lyrics_to_files(files, bundle, track=track, interactive=interactive)
         return
 
-    # Resolve full TTML and LRC bundle
-    bundle = resolve_lyrics_bundle(selected_candidate)
-    if not bundle.get("ttml") and not bundle.get("lrc"):
-        log.warning(f"{PLUGIN_NAME}: Empty lyrics received for \"{title}\"")
-        return
+    # Automatic flow: enqueue on the background fetch queue (never blocks the UI).
+    _ensure_queue_ready()
+    source_pref = config["betterlyrics_source"]
+    clean_words = bool(config["betterlyrics_clean_word_timestamps"])
+    tolerance = int(config["betterlyrics_duration_tolerance"])
 
-    saved = save_lyrics_to_files(files, bundle, track=track, interactive=interactive)
-    if saved:
-        log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
+    submitted = FETCH_QUEUE.submit(
+        job_fn=partial(
+            _find_best_bundle, title, artist, album_name, length, isrc, source_pref, clean_words, tolerance
+        ),
+        apply_fn=partial(_apply_auto_bundle, title, files, track),
+        key=_dedup_key(track, files, method),
+    )
+    if submitted:
+        log.info(
+            f"{PLUGIN_NAME}: Queued lyrics search for \"{title}\" by \"{artist}\" "
+            f"({format_duration(length)}); {FETCH_QUEUE.pending} job(s) pending"
+        )
+    else:
+        log.debug(f"{PLUGIN_NAME}: duplicate lyrics job for \"{title}\" ignored")
 
 
 # ---------------------------------------------------------------------------
@@ -1358,6 +1810,41 @@ class BetterLyricsOptionsPage(OptionsPage):
         tol_h.addWidget(self.duration_spin)
         adv_layout.addLayout(tol_h)
 
+        # Background fetch queue tuning (stability / anti-abuse)
+        perf_group = QtWidgets.QGroupBox("Performance & Stability (Background Queue)", self)
+        perf_layout = QtWidgets.QVBoxLayout(perf_group)
+
+        workers_h = QtWidgets.QHBoxLayout()
+        workers_label = QtWidgets.QLabel("Max parallel requests:", self)
+        self.workers_spin = QtWidgets.QSpinBox(self)
+        self.workers_spin.setRange(1, 8)
+        self.workers_spin.setValue(3)
+        self.workers_spin.setToolTip(
+            "Number of background worker threads used to fetch lyrics.\n"
+            "Higher values finish larger libraries faster but use more bandwidth."
+        )
+        workers_h.addWidget(workers_label)
+        workers_h.addWidget(self.workers_spin)
+        workers_h.addStretch()
+        perf_layout.addLayout(workers_h)
+
+        rate_h = QtWidgets.QHBoxLayout()
+        rate_label = QtWidgets.QLabel("Minimum delay between requests (ms):", self)
+        self.rate_spin = QtWidgets.QSpinBox(self)
+        self.rate_spin.setRange(0, 5000)
+        self.rate_spin.setSingleStep(50)
+        self.rate_spin.setValue(200)
+        self.rate_spin.setToolTip(
+            "Minimum spacing between outbound HTTP requests across all workers.\n"
+            "Prevents API abuse and rate-limit (HTTP 429) responses. 0 disables pacing."
+        )
+        rate_h.addWidget(rate_label)
+        rate_h.addWidget(self.rate_spin)
+        rate_h.addStretch()
+        perf_layout.addLayout(rate_h)
+
+        adv_layout.addWidget(perf_group)
+
         api_h = QtWidgets.QHBoxLayout()
         api_label = QtWidgets.QLabel("Better Lyrics API Key (Optional):", self)
         self.api_key_input = QtWidgets.QLineEdit(self)
@@ -1404,6 +1891,8 @@ class BetterLyricsOptionsPage(OptionsPage):
 
         self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 5)))
         self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "")))
+        self.workers_spin.setValue(int(cfg.get("betterlyrics_max_workers", 3)))
+        self.rate_spin.setValue(int(cfg.get("betterlyrics_rate_limit_ms", 200)))
 
     def save(self):
         api = getattr(self, "api", None) or get_plugin_api()
@@ -1433,6 +1922,17 @@ class BetterLyricsOptionsPage(OptionsPage):
         cfg["betterlyrics_source"] = src_data or "all"
         cfg["betterlyrics_duration_tolerance"] = self.duration_spin.value()
         cfg["betterlyrics_api_key"] = self.api_key_input.text().strip()
+        cfg["betterlyrics_max_workers"] = self.workers_spin.value()
+        cfg["betterlyrics_rate_limit_ms"] = self.rate_spin.value()
+
+        # Apply the request pacer immediately; worker count applies on next reload.
+        try:
+            if _RATE_LIMITER is not None:
+                _RATE_LIMITER.set_interval(self.rate_spin.value() / 1000.0)
+            if FETCH_QUEUE is not None:
+                FETCH_QUEUE.configure(self.workers_spin.value())
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1440,12 +1940,21 @@ class BetterLyricsOptionsPage(OptionsPage):
 # ---------------------------------------------------------------------------
 def enable(api: PluginApi) -> None:
     """Entry point called when the plugin is enabled in MusicBrainz Picard 3.0+."""
-    global CURRENT_PLUGIN_API
+    global CURRENT_PLUGIN_API, _MAIN_INVOKER
     CURRENT_PLUGIN_API = api
 
     # Register options with their defaults
     for key, default in PLUGIN_OPTIONS.items():
         api.plugin_config.register_option(key, default)
+
+    # Prepare the stability layer: caches, request pacer and background queue.
+    _init_caches()
+    _RATE_LIMITER.set_interval(_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0)
+    FETCH_QUEUE.configure(_config_int(api, "betterlyrics_max_workers", 3))
+    if _MAIN_INVOKER is None:
+        _MAIN_INVOKER = MainThreadInvoker()
+    FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
+    FETCH_QUEUE.start()
 
     # Register file processors
     api.register_file_post_addition_to_track_processor(on_file_added)
@@ -1469,4 +1978,10 @@ def enable(api: PluginApi) -> None:
 def disable() -> None:
     """Cleanup hook called when the plugin is disabled in Picard 3.0+."""
     global CURRENT_PLUGIN_API
+    if FETCH_QUEUE is not None:
+        FETCH_QUEUE.stop()
+    if _HTTP_TEXT_CACHE is not None:
+        _HTTP_TEXT_CACHE.clear()
+    if _JSON_CACHE is not None:
+        _JSON_CACHE.clear()
     CURRENT_PLUGIN_API = None

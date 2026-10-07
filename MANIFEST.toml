@@ -1,7 +1,7 @@
 uuid = "54a404d6-5889-460d-af1f-a73ef311197e"
 name = "Better Lyrics"
 authors = ["zoltrons"]
-version = "1.1.0"
+version = "1.2.0"
 description = "Fetches synchronized TTML and LRC lyrics from Better Lyrics (LRC.red and Unison)"
 long_description = """
 A MusicBrainz Picard plugin that fetches synchronized TTML (Timed Text Markup Language) and LRC lyrics from the Better Lyrics ecosystem (LRC.red and Unison).
@@ -10,6 +10,7 @@ Features:
 - Native TTML support (embedded in tags and saved as .ttml sidecar)
 - Standard and enhanced LRC support with word-sync cleaning
 - Smart matching with duration tolerance, title/artist similarity, and ISRC
+- Non-blocking background fetch queue with rate limiting, retries and caching
 - Built for Picard 3.0+ Plugin v3 architecture (PyQt6)
 """
 api = ["3.0", "3.1"]
