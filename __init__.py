@@ -201,7 +201,7 @@ def _ensure_queue_ready() -> None:
     global _MAIN_INVOKER
     _init_caches()
     if _MAIN_INVOKER is None:
-        _MAIN_INVOKER = MainThreadInvoker()
+        _MAIN_INVOKER = MainThreadDispatcher()
     FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
     if not FETCH_QUEUE.is_running:
         FETCH_QUEUE.start()
@@ -669,28 +669,149 @@ def fetch_text(
 # ---------------------------------------------------------------------------
 # Main-Thread Bridge & Background Fetch Queue (stability + anti-abuse)
 # ---------------------------------------------------------------------------
-class MainThreadInvoker(QtCore.QObject):
-    """Marshals callables from worker threads onto the Qt main thread.
+def _get_main_window():
+    """Best-effort lookup of Picard's main window (GUI only)."""
+    try:
+        from picard import tagger_instance
 
-    A queued signal/slot connection guarantees the slot runs in the thread that
-    owns this object (the GUI thread), where Picard's data model (tracks, files,
-    metadata) must be mutated.
+        tagger = tagger_instance()
+        window = getattr(tagger, "window", None)
+        if window is not None:
+            return window
+    except Exception:
+        pass
+    # Fallback: locate the application's main window among top-level widgets.
+    try:
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            for widget in app.topLevelWidgets():
+                if type(widget).__name__ == "MainWindow":
+                    return widget
+    except Exception:
+        pass
+    return None
+
+
+def _set_status_message(text: str) -> None:
+    """Shows a transient message in Picard's status bar, if accessible."""
+    window = _get_main_window()
+    if window is None:
+        return
+    helper = getattr(window, "set_statusbar_message", None)
+    if callable(helper):
+        try:
+            helper(text)
+            return
+        except Exception:
+            pass
+    status_bar = getattr(window, "statusBar", None)
+    if callable(status_bar):
+        try:
+            status_bar().showMessage(text)
+            return
+        except Exception:
+            pass
+    status_bar = getattr(window, "statusbar", None)
+    if status_bar is not None and hasattr(status_bar, "showMessage"):
+        try:
+            status_bar.showMessage(text)
+        except Exception:
+            pass
+
+
+def _clear_status_message() -> None:
+    """Clears the transient status-bar message shown by this plugin."""
+    window = _get_main_window()
+    if window is None:
+        return
+    helper = getattr(window, "clear_statusbar_message", None)
+    if callable(helper):
+        try:
+            helper()
+            return
+        except Exception:
+            pass
+    status_bar = getattr(window, "statusBar", None)
+    if callable(status_bar):
+        try:
+            status_bar().clearMessage()
+            return
+        except Exception:
+            pass
+    status_bar = getattr(window, "statusbar", None)
+    if status_bar is not None and hasattr(status_bar, "clearMessage"):
+        try:
+            status_bar.clearMessage()
+        except Exception:
+            pass
+
+
+class MainThreadDispatcher(QtCore.QObject):
+    """Delivers worker results to the GUI thread and mirrors queue progress.
+
+    Instead of marshalling results through cross-thread Qt signals, worker
+    threads push plain callables onto a thread-safe queue which a ``QTimer``
+    drains on the GUI thread.  This is robust regardless of how the worker
+    threads are created, and the same timer keeps Picard's status bar updated
+    with the number of tracks still waiting in the lyrics queue.
     """
 
-    _invoke = QtCore.pyqtSignal(object)
-
-    def __init__(self):
+    def __init__(self, poll_ms: int = 100):
         super().__init__()
-        self._invoke.connect(self._run, Qt.ConnectionType.QueuedConnection)
-
-    def _run(self, fn):
+        self._callbacks: "queue.Queue" = queue.Queue()
+        self._last_status: str | None = None
+        self._timer = None
         try:
-            fn()
+            self._timer = QtCore.QTimer(self)
+            self._timer.setInterval(max(20, int(poll_ms)))
+            self._timer.timeout.connect(self.poll)
+            self._timer.start()
         except Exception as e:
-            log.error(f"{PLUGIN_NAME}: error applying queued result: {e}", exc_info=True)
+            log.warning(f"{PLUGIN_NAME}: progress timer unavailable: {e}")
 
     def post(self, fn) -> None:
-        self._invoke.emit(fn)
+        """Queues a callable to run on the GUI thread (thread-safe)."""
+        self._callbacks.put(fn)
+
+    def stop(self) -> None:
+        try:
+            if self._timer is not None:
+                self._timer.stop()
+        except Exception:
+            pass
+        try:
+            if self._last_status is not None:
+                _clear_status_message()
+        except Exception:
+            pass
+        self._last_status = None
+
+    def poll(self) -> None:
+        """Runs pending callbacks, then refreshes the queue status message."""
+        while True:
+            try:
+                fn = self._callbacks.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                fn()
+            except Exception as e:
+                log.error(f"{PLUGIN_NAME}: error applying queued result: {e}", exc_info=True)
+        self._update_status()
+
+    def _update_status(self) -> None:
+        try:
+            outstanding = FETCH_QUEUE.pending + FETCH_QUEUE.active if FETCH_QUEUE is not None else 0
+        except Exception:
+            outstanding = 0
+        text = f"{PLUGIN_NAME}: {outstanding} track(s) in lyrics queue..." if outstanding > 0 else None
+        if text == self._last_status:
+            return
+        self._last_status = text
+        if text is None:
+            _clear_status_message()
+        else:
+            _set_status_message(text)
 
 
 class _FetchTask:
@@ -711,7 +832,7 @@ class FetchQueue:
       * a configurable, bounded worker pool instead of an unbounded burst,
       * deduplication of identical in-flight jobs (``key``),
       * graceful start/stop,
-      * results delivered back to the GUI thread via :class:`MainThreadInvoker`.
+      * results delivered back to the GUI thread via :class:`MainThreadDispatcher`.
     """
 
     def __init__(self, max_workers: int = 3):
@@ -722,6 +843,7 @@ class FetchQueue:
         self._pending_keys: set = set()
         self._running = False
         self._invoker = None
+        self._active = 0
 
     def configure(self, max_workers: int | None = None) -> None:
         if max_workers is not None:
@@ -739,6 +861,17 @@ class FetchQueue:
     def pending(self) -> int:
         """Approximate number of queued (not yet started) jobs."""
         return self._queue.qsize()
+
+    @property
+    def active(self) -> int:
+        """Number of jobs currently being processed by a worker."""
+        with self._lock:
+            return self._active
+
+    @property
+    def outstanding(self) -> int:
+        """Total jobs waiting or in progress (used for the progress indicator)."""
+        return self.pending + self.active
 
     def start(self) -> None:
         with self._lock:
@@ -771,6 +904,7 @@ class FetchQueue:
             worker.join(timeout=5.0)
         with self._lock:
             self._pending_keys.clear()
+            self._active = 0
         log.debug(f"{PLUGIN_NAME}: fetch queue stopped")
 
     def submit(self, job_fn, apply_fn=None, key=None) -> bool:
@@ -792,6 +926,9 @@ class FetchQueue:
     def _worker_loop(self) -> None:
         while True:
             task = self._queue.get()
+            if task is not None:
+                with self._lock:
+                    self._active += 1
             try:
                 if task is None:
                     return
@@ -807,6 +944,9 @@ class FetchQueue:
                     else:
                         log.debug(f"{PLUGIN_NAME}: no main-thread invoker; result dropped")
             finally:
+                if task is not None:
+                    with self._lock:
+                        self._active = max(0, self._active - 1)
                 self._release_key(getattr(task, "key", None))
                 self._queue.task_done()
 
@@ -1561,10 +1701,17 @@ def fetch_and_apply_lyrics(
 # ---------------------------------------------------------------------------
 # Picard 3.0 Processor Hooks
 # ---------------------------------------------------------------------------
-def on_file_added(api: PluginApi, track: Track, file: File) -> None:
-    """Processor hook: runs automatically when a file is added to a track."""
-    cfg = api.plugin_config
-    if not cfg.get("betterlyrics_get_on_load", True):
+def on_file_added(api, track, file=None) -> None:
+    """Processor hook: runs automatically when a file is added to a track.
+
+    Picard's ``PluginApi`` may invoke registered processors as either
+    ``fn(api, track, file)`` or ``fn(track, file)`` depending on the API
+    version, so both forms are accepted here.
+    """
+    if file is None:  # called as (track, file)
+        api, track, file = None, api, track
+
+    if not config.get("betterlyrics_get_on_load", True):
         return
     try:
         files = getattr(track, "files", []) or [file]
@@ -1572,13 +1719,18 @@ def on_file_added(api: PluginApi, track: Track, file: File) -> None:
         if metadata:
             fetch_and_apply_lyrics("load", track, files, metadata, interactive=False)
     except Exception as err:
-        api.logger.error("Error in on_file_added: %s", err, exc_info=True)
+        log.error(f"{PLUGIN_NAME}: Error in on_file_added: {err}", exc_info=True)
 
 
-def on_file_saved(api: PluginApi, file: File) -> None:
-    """Processor hook: runs automatically when an audio file is saved."""
-    cfg = api.plugin_config
-    if not cfg.get("betterlyrics_get_on_save", False):
+def on_file_saved(api, file=None) -> None:
+    """Processor hook: runs automatically when an audio file is saved.
+
+    Accepts both ``fn(api, file)`` and ``fn(file)`` invocation forms.
+    """
+    if file is None:  # called as (file,)
+        api, file = None, api
+
+    if not config.get("betterlyrics_get_on_save", False):
         return
     if file.filename in files_processing:
         files_processing.discard(file.filename)
@@ -1591,7 +1743,7 @@ def on_file_saved(api: PluginApi, file: File) -> None:
         metadata = getattr(track, "metadata", None) or file.metadata
         fetch_and_apply_lyrics("save", track, [file], metadata, interactive=False)
     except Exception as err:
-        api.logger.error("Error in on_file_saved: %s", err, exc_info=True)
+        log.error(f"{PLUGIN_NAME}: Error in on_file_saved: {err}", exc_info=True)
     finally:
         files_processing.discard(file.filename)
 
@@ -1952,7 +2104,7 @@ def enable(api: PluginApi) -> None:
     _RATE_LIMITER.set_interval(_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0)
     FETCH_QUEUE.configure(_config_int(api, "betterlyrics_max_workers", 3))
     if _MAIN_INVOKER is None:
-        _MAIN_INVOKER = MainThreadInvoker()
+        _MAIN_INVOKER = MainThreadDispatcher()
     FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
     FETCH_QUEUE.start()
 
@@ -1980,6 +2132,8 @@ def disable() -> None:
     global CURRENT_PLUGIN_API
     if FETCH_QUEUE is not None:
         FETCH_QUEUE.stop()
+    if _MAIN_INVOKER is not None:
+        _MAIN_INVOKER.stop()
     if _HTTP_TEXT_CACHE is not None:
         _HTTP_TEXT_CACHE.clear()
     if _JSON_CACHE is not None:

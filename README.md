@@ -106,6 +106,8 @@ Automatic lyric lookups run on a background worker queue instead of the UI threa
 - **Retries** transient failures (network errors, HTTP 408/425/429/5xx) with jittered exponential backoff.
 - **Caches** successful responses (and briefly caches failures) to reduce repeat lookups.
 
+While work is outstanding, the number of tracks still waiting is shown in Picard's status bar (e.g. *Better Lyrics: 7 track(s) in lyrics queue...*), so you can see at a glance how much is left.
+
 Tune these under **Options -> Plugins -> Better Lyrics -> Sources & Advanced Settings -> Performance & Stability**. The request delay applies immediately; the worker count takes effect after reloading the plugin or restarting Picard.
 
 ---
