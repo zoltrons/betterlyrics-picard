@@ -1,97 +1,93 @@
-# Better Lyrics (TTML & LRC) - MusicBrainz Picard 3.0+ & 2.x Plugin
+# betterlyrics-picard
 
-[MusicBrainz Picard](https://picard.musicbrainz.org/) 3.0+ ve 2.x sürümleri için [Better Lyrics](https://github.com/better-lyrics/better-lyrics) ekosistemi tabanlı, **TTML (Timed Text Markup Language)** ve **LRC** şarkı sözü indirme ve etiketleme eklentisidir.
+A [MusicBrainz Picard](https://picard.musicbrainz.org/) plugin that fetches synchronized **TTML** (Timed Text Markup Language) and **LRC** lyrics from the [Better Lyrics](https://github.com/better-lyrics/better-lyrics) ecosystem ([LRC.red](https://lrc.red) and [Unison](https://unison.betterlyrics.org)).
 
-Eski `picard-lrclib` eklentisi temel alınarak; **Picard 3.0 (PyQt6)** ve **Picard 2.x (PyQt5)** mimarisiyle tam uyumlu, Apple Music tarzı **zengin TTML XML** sözlerini doğrudan ses dosyası etiketlerine (`lyrics`, `ttml`) yazacak ve `.ttml` dosyası kaydedecek şekilde sıfırdan geliştirilmiştir.
-
----
-
-## 🌟 TTML ve Temel Özellikler
-
-1. **Birinci Sınıf TTML (Apple Music XML) Desteği**:
-   - **Doğrudan Etiketlere Gömme**: Orijinal, kayıpsız Better Lyrics / Apple Music TTML XML metnini doğrudan ses dosyası meta verilerine yazar:
-     - M4A / ALAC / MP4 için `©lyr` atomuna.
-     - FLAC / OGG için `LYRICS` etiketine.
-     - MP3 için `USLT` çerçevesine.
-     - Özel `ttml` etiketine (`file.metadata["ttml"]`).
-   - **Harici `.ttml` Dosyası Kaydetme**: Parçanın yanına doğrudan `Şarkı.ttml` sidecar dosyası oluşturur.
-   - **Çift Format (Dual Export)**: İsteğe bağlı olarak hem `.ttml` hem de geleneksel oynatıcılar için `.lrc` dosyasını aynı anda oluşturabilir.
-   - **LRC -> TTML Dönüştürücü**: Kaynakta sadece LRC mevcutsa, bunu otomatik olarak geçerli ve standart bir TTML XML belgesine dönüştürür.
-2. **Better Lyrics Hibrit Veri Kaynakları**:
-   - **LRC.red API (`https://lrc.red/api/v1`)**: Better Lyrics ekosisteminin birincil veri kaynağı (w4v tarafından sunulan zengin TTML ve kelime/satır senkronlu katalog).
-   - **Unison API (`https://unison.betterlyrics.org`)**: Better Lyrics'in resmi açık topluluk ve crowdsourced TTML söz veritabanı.
-   - **Better Lyrics API (`https://api.betterlyrics.org`)**: İsteğe bağlı özel API anahtarı desteği.
-3. **Akıllı Eşleşme (Smart Match Scoring)**:
-   - Şarkı Adı ve Sanatçı benzerlik skorlaması (`difflib.SequenceMatcher`).
-   - Albüm adı ve süre toleransı (varsayılan ±4 sn) ile stüdyo/albüm versiyonu eşleşmesi.
-   - **ISRC Eşleşmesi**: MusicBrainz ISRC koduyla doğrudan birebir kesin eşleşme.
-4. **İnteraktif Manuel Arama & TTML Önizleme**:
-   - Şarkıya sağ tıklayıp arama yapabilme.
-   - Sonuç listesinde formatı (`TTML (Word)`, `TTML (Line)`, `Plain`) görebilme.
-   - **"Preview Selected"** penceresinde **TTML (XML)** ve **LRC (Synced)** sekmeleri arasında geçiş yaparak içeriği inceleyebilme.
-5. **Otomasyon & Temizlik**:
-   - Parça Picard'a yüklendiğinde otomatik indirme (`get_on_load`).
-   - Parça kaydedildiğinde otomatik indirme (`get_on_save`).
-   - Müzik kütüphanesindeki yetim `.ttml` ve `.lrc` dosyalarını tarayıp silen temizleme aracı.
-6. **Picard 3.0 & 2.x (PyQt6/PyQt5) Uyumluluğu**:
-   - PyQt6 ve PyQt5 arasında otomatik dinamik geçiş katmanı.
+Compatible with both **Picard 3.0+ (PyQt6)** and **Picard 2.x (PyQt5)**.
 
 ---
 
-## 🚀 Kurulum
+## Features
+
+- **Native TTML Support**: Fetches and embeds Apple Music / Better Lyrics-compliant TTML XML directly into audio file metadata (`©lyr` for MP4/M4A, `USLT` for MP3, `LYRICS` and `ttml` tags for FLAC/Vorbis), preserving word-by-word timing, roles, and background vocals.
+- **Sidecar File Export**: Saves `.ttml` and/or `.lrc` files directly alongside your audio tracks (`Track.ttml`, `Track.lrc`).
+- **LRC Conversion & Word-Sync Cleaning**: Converts TTML to LRC on the fly when needed. Strips inline word timestamps (`<mm:ss.xx>`) into standard line timestamps (`[mm:ss.xx]`) for broad player compatibility (Plex, Jellyfin, Foobar2000, VLC, mobile players).
+- **Dual Backend Providers**:
+  - **LRC.red API**: Primary synced lyrics catalog used by Better Lyrics.
+  - **Unison API**: Official crowdsourced community database of Better Lyrics.
+  - **Better Lyrics API**: Optional support for custom API keys.
+- **Smart Match Scoring**: Ranks results using title and artist fuzzy matching (`SequenceMatcher`), album identity, duration tolerance (default ±4s), and exact MusicBrainz ISRC matching.
+- **Interactive Search Dialog**: Right-click any track or album to search manually, view results in a detailed table (title, artist, album, duration, sync type, source), and inspect lyrics with side-by-side TTML/LRC preview before applying.
+- **Automation Hooks**: Optional automatic search and retrieval when loading tracks into Picard or when saving files.
+- **Library Maintenance**: Built-in tool to scan your music directory and clean up orphaned `.ttml` and `.lrc` files whose audio counterparts have been removed.
+
+---
+
+## Installation
+
+Download [`better_lyrics.py`](better_lyrics.py) and place it into your Picard plugins directory:
 
 ### macOS
-1. `better_lyrics.py` dosyasını Picard eklentileri dizinine kopyalayın:
-   ```bash
-   cp better_lyrics.py ~/Library/Preferences/MusicBrainz/Picard/plugins/
-   ```
-2. MusicBrainz Picard'ı açın (veya yeniden başlatın).
-3. **Seçenekler (Preferences) -> Eklentiler (Plugins)** bölümüne gidin.
-4. **Better Lyrics** eklentisini etkinleştirin.
+```bash
+mkdir -p ~/Library/Preferences/MusicBrainz/Picard/plugins
+cp better_lyrics.py ~/Library/Preferences/MusicBrainz/Picard/plugins/
+```
 
 ### Windows
-1. `better_lyrics.py` dosyasını aşağıdaki dizine kopyalayın:
-   ```
-   %APPDATA%\MusicBrainz\Picard\plugins\
-   ```
-   *(Örn: `C:\Users\<Kullanıcı>\AppData\Roaming\MusicBrainz\Picard\plugins\`)*
-2. Picard'ı açıp **Seçenekler -> Eklentiler** bölümünden eklentiyi aktifleştirin.
+Copy `better_lyrics.py` to:
+```
+%APPDATA%\MusicBrainz\Picard\plugins\
+```
+*(e.g., `C:\Users\<Username>\AppData\Roaming\MusicBrainz\Picard\plugins\`)*
 
 ### Linux
-1. `better_lyrics.py` dosyasını aşağıdaki dizine kopyalayın:
-   ```bash
-   cp better_lyrics.py ~/.config/MusicBrainz/Picard/plugins/
-   ```
-2. Picard'ı açıp eklentiyi aktifleştirin.
+```bash
+mkdir -p ~/.config/MusicBrainz/Picard/plugins
+cp better_lyrics.py ~/.config/MusicBrainz/Picard/plugins/
+```
+
+After placing the file, open Picard, navigate to **Options -> Plugins**, and enable **Better Lyrics**.
 
 ---
 
-## ⚙️ Yapılandırma ve Seçenekler
+## Configuration
 
-Picard içerisinde **Seçenekler -> Eklentiler -> Better Lyrics** sayfasından ayarları yönetebilirsiniz:
+Settings are available under **Options -> Plugins -> Better Lyrics**:
 
-| Ayar | Varsayılan | Açıklama |
+| Setting | Default | Description |
 |---|---|---|
-| **Primary Lyrics Format** | `TTML` | `TTML (Apple Music XML)`, `LRC` veya `Both TTML and LRC (Dual Export)` |
-| **Embed into 'lyrics' tag** | `Açık (True)` | Seçilen formatı (TTML/LRC) parça etiketine gömer (M4A'da `©lyr`, MP3'te `USLT`, FLAC'ta `LYRICS`). |
-| **Embed into 'ttml' tag** | `Açık (True)` | Ham TTML XML verisini doğrudan `ttml` etiketine yazar. |
-| **Save external .ttml sidecar file** | `Açık (True)` | Parçanın yanına `Şarkı.ttml` dosyası kaydeder. |
-| **Save external .lrc sidecar file** | `Kapalı (False)` | Parçanın yanına `Şarkı.lrc` dosyası kaydeder. |
-| **Clean word timestamps in LRC** | `Açık (True)` | LRC çıktısında kelime zaman damgalarını temizleyip satır formatına indirger. |
-| **Search when loading tracks** | `Açık (True)` | Parça Picard'a yüklendiğinde otomatik indirir. |
-| **Search when saving files** | `Kapalı (False)` | Parça kaydedilirken otomatik indirir. |
-| **Auto overwrite existing lyrics** | `Kapalı (False)` | Mevcut sözlerin üzerine onay sormadan yazar. |
-| **Primary Source** | `All Sources` | `All Sources (Smart Hybrid)`, `LRC.red` veya `Unison` seçimi. |
-| **Duration tolerance (seconds)** | `4` | Azami süre farkı toleransı (saniye). |
+| **Primary Lyrics Format** | `TTML` | Choose between `TTML (Apple Music XML)`, `LRC (Standard Synced)`, or `Both TTML and LRC (Dual Export)`. |
+| **Embed into 'lyrics' tag** | `Enabled` | Writes primary lyrics format into standard metadata tags (`©lyr`, `USLT`, `LYRICS`). |
+| **Embed into 'ttml' tag** | `Enabled` | Writes raw TTML XML into a dedicated `ttml` metadata tag. |
+| **Embed into 'syncedlyrics' tag** | `Disabled` | Writes synchronized lyrics to the `syncedlyrics` tag for compatible players. |
+| **Save external .ttml sidecar file** | `Enabled` | Saves a `.ttml` file alongside the audio file. |
+| **Save external .lrc sidecar file** | `Disabled` | Saves a `.lrc` file alongside the audio file. |
+| **Clean word timestamps in LRC** | `Enabled` | Strips `<mm:ss.xx>` word-level tags from LRC output for wider player compatibility. |
+| **Prefer synchronized lyrics** | `Enabled` | Prefers time-synced lyrics over plain text when available. |
+| **Ignore instrumental tracks** | `Enabled` | Skips queries for tracks labeled as instrumental. |
+| **Search when loading tracks** | `Enabled` | Automatically queries for lyrics when a track is added to Picard. |
+| **Search when saving files** | `Disabled` | Automatically queries for lyrics when saving files. |
+| **Auto overwrite existing lyrics** | `Disabled` | Overwrites existing tags and sidecars without prompting. |
+| **Primary Source** | `All Sources` | Select `All Sources (Smart Hybrid)`, `LRC.red`, or `Unison`. |
+| **Duration tolerance (seconds)** | `4` | Maximum allowable difference between audio track length and lyric duration. |
+| **Better Lyrics API Key** | *(empty)* | Optional API key for `api.betterlyrics.org`. |
 
 ---
 
-## 🎯 Kullanım
+## Usage
 
-1. **Otomatik İndirme**: Picard'a eklediğiniz parçalar için Better Lyrics arka planda TTML sözleri bulup parça etiketine ve/veya `.ttml` dosyasına kaydeder.
-2. **Manuel Arama**: Şarkıya sağ tıklayıp **Plugins -> Search lyrics (TTML / LRC) manually with Better Lyrics** seçeneğine tıklayın. Çıkan pencerede TTML ve LRC önizlemesini görüp istediğiniz sonucu şarkıya uygulayabilirsiniz.
+### Automatic Tagging
+When you load albums or tracks into Picard, Better Lyrics automatically matches the track against available databases, retrieves the best match based on duration and ISRC, and writes the lyrics according to your configuration.
+
+### Manual Actions
+Right-click any track or album in Picard's selection view:
+- **Plugins -> Get lyrics (TTML / LRC) automatically with Better Lyrics**: Executes the scoring and matching pipeline for the selected item(s).
+- **Plugins -> Search lyrics (TTML / LRC) manually with Better Lyrics**: Opens the search dialog. You can refine your search query, browse candidates, preview both TTML (XML) and LRC versions, and double-click or press OK to apply.
+
+### Orphaned File Cleaner
+Under **Options -> Plugins -> Better Lyrics**, click **Clean Orphaned .ttml / .lrc Files in Library...** and select your music root directory. The plugin will recursively delete any `.ttml` or `.lrc` sidecars that no longer correspond to an audio file.
 
 ---
 
-## 📜 Lisans
-Bu proje [MIT Lisansı](LICENSE) ile lisanslanmıştır.
+## License
+
+This project is licensed under the [MIT License](LICENSE).

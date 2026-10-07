@@ -111,7 +111,7 @@ from picard.ui.options import (
 # Plugin Metadata
 # ---------------------------------------------------------------------------
 PLUGIN_NAME = "Better Lyrics"
-PLUGIN_AUTHOR = "Better Lyrics Community / Picard Plugin"
+PLUGIN_AUTHOR = "zoltrons"
 PLUGIN_DESCRIPTION = (
     "Fetch high-quality TTML (Timed Text Markup Language) and LRC lyrics using the "
     "Better Lyrics ecosystem (LRC.red, Unison crowdsourced database & Better Lyrics API). "
@@ -125,7 +125,7 @@ PLUGIN_API_VERSIONS = [
 ]
 PLUGIN_LICENSE = "MIT"
 PLUGIN_LICENSE_URL = "https://opensource.org/licenses/MIT"
-PLUGIN_USER_GUIDE_URL = "https://github.com/better-lyrics/better-lyrics"
+PLUGIN_USER_GUIDE_URL = "https://github.com/zoltrons/betterlyrics-picard"
 
 # ---------------------------------------------------------------------------
 # Default Settings
