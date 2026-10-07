@@ -12,6 +12,7 @@ from functools import partial
 import json
 import os
 import re
+import ssl
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
@@ -55,7 +56,7 @@ PLUGIN_OPTIONS = {
     "betterlyrics_plain_as_txt": False,
     # Sources & Matching
     "betterlyrics_source": "all",  # "all", "lrcred", "unison"
-    "betterlyrics_duration_tolerance": 4,  # seconds
+    "betterlyrics_duration_tolerance": 5,  # seconds
     "betterlyrics_api_key": "",
 }
 
@@ -66,8 +67,8 @@ UNISON_SEARCH_URL = "https://unison.betterlyrics.org/lyrics/search"
 BETTER_LYRICS_API_URL = "https://api.betterlyrics.org/getLyrics"
 
 DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (compatible; MusicBrainzPicard-BetterLyrics/1.1; "
-    "+https://github.com/better-lyrics/better-lyrics)"
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36 MusicBrainzPicard-BetterLyrics/1.1"
 )
 
 # PyQt6 Layout & View Alignment Constants
@@ -92,6 +93,20 @@ AUDIO_EXTENSIONS = {
     ".spx", ".tak", ".tta", ".wav", ".wma", ".wv"
 }
 
+# Global reference to PluginApi instance
+CURRENT_PLUGIN_API: PluginApi | None = None
+
+
+def get_plugin_api() -> PluginApi | None:
+    """Retrieves the active PluginApi instance."""
+    global CURRENT_PLUGIN_API
+    if CURRENT_PLUGIN_API is not None:
+        return CURRENT_PLUGIN_API
+    try:
+        return PluginApi.get_api()
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
 # API, Logger & Config Proxies
@@ -101,11 +116,11 @@ class LoggerProxy:
 
     @property
     def _logger(self):
-        try:
-            return PluginApi.get_api().logger
-        except Exception:
-            import logging
-            return logging.getLogger("better_lyrics")
+        api = get_plugin_api()
+        if api and hasattr(api, "logger"):
+            return api.logger
+        import logging
+        return logging.getLogger("better_lyrics")
 
     def info(self, msg, *args, **kwargs):
         self._logger.info(msg, *args, **kwargs)
@@ -127,25 +142,27 @@ class ConfigProxy:
     """Routes configuration lookups and updates to api.plugin_config."""
 
     def get(self, key: str, default=None):
-        try:
-            api = PluginApi.get_api()
-            return api.plugin_config.get(key, PLUGIN_OPTIONS.get(key, default))
-        except Exception:
-            return PLUGIN_OPTIONS.get(key, default)
+        api = get_plugin_api()
+        if api and hasattr(api, "plugin_config"):
+            try:
+                val = api.plugin_config.get(key)
+                if val is not None and val != "":
+                    return val
+            except Exception:
+                pass
+        return PLUGIN_OPTIONS.get(key, default)
 
     def __getitem__(self, key: str):
-        try:
-            api = PluginApi.get_api()
-            return api.plugin_config.get(key, PLUGIN_OPTIONS.get(key))
-        except Exception:
-            return PLUGIN_OPTIONS.get(key)
+        return self.get(key, PLUGIN_OPTIONS.get(key))
 
     def __setitem__(self, key: str, value):
-        try:
-            api = PluginApi.get_api()
-            api.plugin_config[key] = value
-        except Exception:
-            PLUGIN_OPTIONS[key] = value
+        api = get_plugin_api()
+        if api and hasattr(api, "plugin_config"):
+            try:
+                api.plugin_config[key] = value
+            except Exception:
+                pass
+        PLUGIN_OPTIONS[key] = value
 
 
 config = ConfigProxy()
@@ -196,12 +213,13 @@ def parse_duration(time_val) -> int:
 
 def get_track_duration(track: Track) -> int:
     """Extracts duration in seconds from track or file metadata."""
-    metadata = track.metadata
-    if metadata.get("~length"):
+    metadata = getattr(track, "metadata", None)
+    if metadata and metadata.get("~length"):
         return parse_duration(str(metadata["~length"]))
-    if track.files:
-        tr_meta = track.files[0].metadata
-        if tr_meta.get("~length"):
+    files = getattr(track, "files", [])
+    if files:
+        tr_meta = getattr(files[0], "metadata", None)
+        if tr_meta and tr_meta.get("~length"):
             return parse_duration(str(tr_meta["~length"]))
     return 0
 
@@ -356,8 +374,16 @@ def is_lrc_synced(lrc_text: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# HTTP Networking Helpers
+# HTTP Networking Helpers with SSL Fallback
 # ---------------------------------------------------------------------------
+def _get_ssl_context():
+    """Returns an SSL context, falling back to unverified if system certs are missing."""
+    try:
+        return ssl.create_default_context()
+    except Exception:
+        return ssl._create_unverified_context()
+
+
 def fetch_json(url: str, params: dict | None = None, headers: dict | None = None, timeout: int = 10):
     """Performs a synchronous HTTP GET request and parses the JSON response."""
     try:
@@ -372,14 +398,22 @@ def fetch_json(url: str, params: dict | None = None, headers: dict | None = None
             req_headers.update(headers)
 
         req = Request(full_url, headers=req_headers)
-        with urlopen(req, timeout=timeout) as resp:
+
+        try:
+            ctx = _get_ssl_context()
+            resp = urlopen(req, timeout=timeout, context=ctx)
+        except Exception:
+            unverified_ctx = ssl._create_unverified_context()
+            resp = urlopen(req, timeout=timeout, context=unverified_ctx)
+
+        with resp:
             if resp.status != 200:
-                log.debug(f"{PLUGIN_NAME}: HTTP {resp.status} for {full_url}")
+                log.warning(f"{PLUGIN_NAME}: HTTP {resp.status} for {full_url}")
                 return None
             body = resp.read().decode("utf-8", errors="replace")
             return json.loads(body)
     except Exception as e:
-        log.debug(f"{PLUGIN_NAME}: fetch_json error for {url}: {e}")
+        log.warning(f"{PLUGIN_NAME}: fetch_json error for {url}: {e}")
         return None
 
 
@@ -387,13 +421,20 @@ def fetch_text(url: str, timeout: int = 10) -> str | None:
     """Performs a synchronous HTTP GET request and returns raw string response."""
     try:
         req = Request(url, headers={"User-Agent": DEFAULT_USER_AGENT})
-        with urlopen(req, timeout=timeout) as resp:
+        try:
+            ctx = _get_ssl_context()
+            resp = urlopen(req, timeout=timeout, context=ctx)
+        except Exception:
+            unverified_ctx = ssl._create_unverified_context()
+            resp = urlopen(req, timeout=timeout, context=unverified_ctx)
+
+        with resp:
             if resp.status != 200:
-                log.debug(f"{PLUGIN_NAME}: HTTP {resp.status} for {url}")
+                log.warning(f"{PLUGIN_NAME}: HTTP {resp.status} for {url}")
                 return None
             return resp.read().decode("utf-8", errors="replace")
     except Exception as e:
-        log.debug(f"{PLUGIN_NAME}: fetch_text error for {url}: {e}")
+        log.warning(f"{PLUGIN_NAME}: fetch_text error for {url}: {e}")
         return None
 
 
@@ -418,21 +459,27 @@ def calculate_match_score(
 
     score = 0.0
 
-    # 1. ISRC Exact Match
+    # 1. ISRC Exact Match (Massive confidence boost)
     if target_isrc and item_isrc and target_isrc.strip().upper() == item_isrc.strip().upper():
         score += 0.50
 
     # 2. Title Similarity
-    t_ratio = SequenceMatcher(
-        None, target_title.lower().strip(), item_title.lower().strip()
-    ).ratio()
-    score += t_ratio * 0.35
+    if target_title and item_title:
+        t_ratio = SequenceMatcher(
+            None, target_title.lower().strip(), item_title.lower().strip()
+        ).ratio()
+        score += t_ratio * 0.40
+    else:
+        score += 0.20
 
     # 3. Artist Similarity
-    a_ratio = SequenceMatcher(
-        None, target_artist.lower().strip(), item_artist.lower().strip()
-    ).ratio()
-    score += a_ratio * 0.25
+    if target_artist and item_artist:
+        a_ratio = SequenceMatcher(
+            None, target_artist.lower().strip(), item_artist.lower().strip()
+        ).ratio()
+        score += a_ratio * 0.30
+    else:
+        score += 0.15
 
     # 4. Album Similarity
     if target_album and item_album:
@@ -450,7 +497,7 @@ def calculate_match_score(
             score += 0.15
         elif diff <= 10:
             score += 0.05
-        elif diff > 25:
+        elif diff > 30:
             score -= 0.15
 
     # 6. Prefer Synced / TTML Lyrics
@@ -472,9 +519,14 @@ def search_lrcred(
 ) -> list[dict]:
     """Searches the LRC.red API (Better Lyrics primary catalog)."""
     candidates = []
+    seen_ids = set()
 
-    def make_candidate(res):
-        return {
+    def add_res(res):
+        c_id = res.get("id") or res.get("isrc") or f"{res.get('track_name')}_{res.get('artist_name')}"
+        if c_id in seen_ids:
+            return
+        seen_ids.add(c_id)
+        candidates.append({
             "id": res.get("id"),
             "title": res.get("track_name", ""),
             "artist": res.get("artist_name", ""),
@@ -486,28 +538,23 @@ def search_lrcred(
             "source": "LRC.red",
             "format": "ttml",
             "raw": res,
-        }
+        })
 
     # 1. Search by ISRC
     if isrc:
         data = fetch_json(LRC_RED_API_URL, {"isrc": isrc.strip()})
         if data and isinstance(data, dict):
             for res in data.get("results", []):
-                candidates.append(make_candidate(res))
+                add_res(res)
         if candidates:
             return candidates
 
-    # 2. Search by Track + Artist + Album
+    # 2. Search by Track + Artist
     if title and artist:
-        params = {"track": title, "artist": artist}
-        if album:
-            params["album"] = album
-        data = fetch_json(LRC_RED_API_URL, params)
+        data = fetch_json(LRC_RED_API_URL, {"track": title, "artist": artist})
         if data and isinstance(data, dict):
             for res in data.get("results", []):
-                candidates.append(make_candidate(res))
-        if candidates:
-            return candidates
+                add_res(res)
 
     # 3. Search by Free-form Query
     search_q = query or f"{artist} {title}".strip()
@@ -515,7 +562,7 @@ def search_lrcred(
         data = fetch_json(LRC_RED_API_URL, {"q": search_q})
         if data and isinstance(data, dict):
             for res in data.get("results", []):
-                candidates.append(make_candidate(res))
+                add_res(res)
 
     return candidates
 
@@ -529,40 +576,19 @@ def search_unison(
 ) -> list[dict]:
     """Searches the Unison crowdsourced database (Better Lyrics community backend)."""
     candidates = []
+    seen_ids = set()
 
-    # 1. Direct song + artist lookup
-    if title and artist:
-        params = {"song": title, "artist": artist}
-        if album:
-            params["album"] = album
-        if duration > 0:
-            params["duration"] = str(duration)
-        data = fetch_json(UNISON_API_URL, params)
-        if data and isinstance(data, dict) and data.get("success") and data.get("data"):
-            res = data["data"]
-            candidates.append({
-                "id": res.get("id"),
-                "title": res.get("song", title),
-                "artist": res.get("artist", artist),
-                "album": res.get("album", album),
-                "duration": res.get("duration", duration),
-                "isrc": res.get("isrc", ""),
-                "timing_type": res.get("syncType", "plain"),
-                "format": res.get("format", "ttml"),
-                "source": "Unison",
-                "direct_lyrics": res.get("lyrics"),
-                "raw": res,
-            })
-            return candidates
-
-    # 2. Free-form Search
-    search_q = query or f"{artist} {title}".strip()
+    search_q = query or f"{artist} {title}".strip() or title
     if search_q:
         data = fetch_json(UNISON_SEARCH_URL, {"q": search_q})
         if data and isinstance(data, dict) and data.get("success"):
             for res in data.get("data", []):
+                c_id = res.get("id")
+                if c_id in seen_ids:
+                    continue
+                seen_ids.add(c_id)
                 candidates.append({
-                    "id": res.get("id"),
+                    "id": c_id,
                     "title": res.get("song", ""),
                     "artist": res.get("artist", ""),
                     "album": res.get("album", ""),
@@ -590,10 +616,14 @@ def query_all_sources(
     """Queries LRC.red, Unison, or both according to user preferences."""
     results = []
 
-    if source_preference in ("all", "lrcred"):
+    pref = source_preference or "all"
+    if pref not in ("all", "lrcred", "unison"):
+        pref = "all"
+
+    if pref in ("all", "lrcred"):
         results.extend(search_lrcred(title, artist, album, isrc, query))
 
-    if source_preference in ("all", "unison"):
+    if pref in ("all", "unison"):
         results.extend(search_unison(title, artist, album, duration, query))
 
     for item in results:
@@ -684,10 +714,11 @@ def confirm_replace(parent, title: str, description: str) -> bool:
 def save_lyrics_to_files(
     file_list: list[File],
     bundle: dict,
+    track: Track | None = None,
     interactive: bool = False,
 ) -> bool:
     """Saves lyrics to the given Picard File objects and sidecar files."""
-    if not file_list or not bundle:
+    if not bundle:
         return False
 
     pref_format = config["betterlyrics_format"]  # "ttml", "lrc", "both"
@@ -702,8 +733,22 @@ def save_lyrics_to_files(
     if not primary_tag_content:
         return False
 
+    # Also update track metadata if track is available
+    if track and hasattr(track, "metadata"):
+        if config["betterlyrics_embed_lyrics"]:
+            track.metadata["lyrics"] = primary_tag_content
+        if config["betterlyrics_embed_ttml_tag"] and ttml_content:
+            track.metadata["ttml"] = ttml_content
+        if config["betterlyrics_embed_syncedlyrics"]:
+            track.metadata["syncedlyrics"] = lrc_content or ttml_content
+        if hasattr(track, "update"):
+            track.update()
+
+    if not file_list:
+        return True
+
     for file in file_list:
-        full_path = file.filename
+        full_path = getattr(file, "filename", None)
         if not full_path:
             continue
 
@@ -742,6 +787,10 @@ def save_lyrics_to_files(
 
         if config["betterlyrics_embed_syncedlyrics"]:
             file.metadata["syncedlyrics"] = lrc_content or ttml_content
+
+        # Crucial for Picard: Notify that file has pending metadata changes
+        if hasattr(file, "update"):
+            file.update()
 
         # 2. Save Sidecar Files (.ttml / .lrc)
         save_ttml = config["betterlyrics_save_ttml_file"] or pref_format in ("ttml", "both")
@@ -789,7 +838,7 @@ def show_search_dialog(
     # Search bar layout
     search_layout = QtWidgets.QHBoxLayout()
     search_input = QtWidgets.QLineEdit()
-    default_q = f"{artist} {title}".strip()
+    default_q = f"{artist} {title}".strip() or title
     search_input.setText(default_q)
     search_input.setPlaceholderText("Enter song title and artist...")
     search_button = QtWidgets.QPushButton("Search")
@@ -888,7 +937,7 @@ def show_search_dialog(
         if not query_text:
             return
         current_results = query_all_sources(
-            title="",
+            title=query_text,
             artist="",
             query=query_text,
             source_preference=config["betterlyrics_source"],
@@ -974,10 +1023,10 @@ def fetch_and_apply_lyrics(
     interactive: bool = False,
 ):
     """Main entry point for finding, scoring, and saving TTML/LRC lyrics for a track."""
-    title = metadata.get("title", "").strip()
-    artist = metadata.get("artist", "").strip()
-    album_name = metadata.get("album", "").strip()
-    isrc = metadata.get("isrc", "").strip()
+    title = str(metadata.get("title", "") or "").strip()
+    artist = str(metadata.get("artist", "") or "").strip()
+    album_name = str(metadata.get("album", "") or "").strip()
+    isrc = str(metadata.get("isrc", "") or "").strip()
 
     length = 0
     if metadata.get("~length"):
@@ -1029,11 +1078,12 @@ def fetch_and_apply_lyrics(
             return
 
         best = candidates[0]
-        tolerance = config["betterlyrics_duration_tolerance"]
+        tolerance = int(config["betterlyrics_duration_tolerance"])
 
         if length > 0 and best.get("duration", 0) > 0:
             diff = abs(length - best["duration"])
-            if diff > tolerance and best.get("score", 0.0) < 0.60:
+            # If duration mismatch is large and title/artist score is weak, skip
+            if diff > (tolerance + 5) and best.get("score", 0.0) < 0.50:
                 log.warning(
                     f"{PLUGIN_NAME}: Best match \"{best.get('title')}\" duration difference "
                     f"({diff}s) exceeds tolerance ({tolerance}s) with low score ({best.get('score', 0):.2f})"
@@ -1051,8 +1101,9 @@ def fetch_and_apply_lyrics(
         log.warning(f"{PLUGIN_NAME}: Empty lyrics received for \"{title}\"")
         return
 
-    save_lyrics_to_files(files, bundle, interactive=interactive)
-    log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
+    saved = save_lyrics_to_files(files, bundle, track=track, interactive=interactive)
+    if saved:
+        log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
 
 
 # ---------------------------------------------------------------------------
@@ -1064,11 +1115,10 @@ def on_file_added(api: PluginApi, track: Track, file: File) -> None:
     if not cfg.get("betterlyrics_get_on_load", True):
         return
     try:
-        album = track.album
-        if not isinstance(album, Album):
-            return
-        files = track.files or [file]
-        fetch_and_apply_lyrics("load", track, files, track.metadata, interactive=False)
+        files = getattr(track, "files", []) or [file]
+        metadata = getattr(track, "metadata", None) or getattr(file, "metadata", None)
+        if metadata:
+            fetch_and_apply_lyrics("load", track, files, metadata, interactive=False)
     except Exception as err:
         api.logger.error("Error in on_file_added: %s", err, exc_info=True)
 
@@ -1086,7 +1136,8 @@ def on_file_saved(api: PluginApi, file: File) -> None:
         files_processing.add(file.filename)
         parent = getattr(file, "parent", None)
         track = parent if isinstance(parent, Track) else None
-        fetch_and_apply_lyrics("save", track, [file], file.metadata, interactive=False)
+        metadata = getattr(track, "metadata", None) or file.metadata
+        fetch_and_apply_lyrics("save", track, [file], metadata, interactive=False)
     except Exception as err:
         api.logger.error("Error in on_file_saved: %s", err, exc_info=True)
     finally:
@@ -1094,43 +1145,67 @@ def on_file_saved(api: PluginApi, file: File) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Context Menu Actions
+# Context Menu Actions Helper & Classes
 # ---------------------------------------------------------------------------
+def extract_items(objs):
+    """Normalizes selection objects from Picard context menu into tracks and files."""
+    tracks = set()
+    files = []
+    for item in objs:
+        if isinstance(item, Track):
+            tracks.add(item)
+        elif isinstance(item, Album):
+            for t in getattr(item, "tracks", []):
+                tracks.add(t)
+        elif isinstance(item, File):
+            parent = getattr(item, "parent", None)
+            if isinstance(parent, Track):
+                tracks.add(parent)
+            else:
+                files.append(item)
+        elif hasattr(item, "files"):
+            for f in getattr(item, "files", []):
+                parent = getattr(f, "parent", None)
+                if isinstance(parent, Track):
+                    tracks.add(parent)
+                else:
+                    files.append(f)
+    return list(tracks), files
+
+
 class BetterLyricsGetAction(BaseAction):
     TITLE = "Get lyrics (TTML / LRC) automatically with Better Lyrics"
 
-    def execute_on_track(self, track: Track):
-        if not track.linked_files and not track.files:
-            return
-        files = track.files or list(track.linked_files)
-        fetch_and_apply_lyrics("get", track, files, track.metadata, interactive=False)
-
     def callback(self, objs):
-        for item in objs:
-            if isinstance(item, Track):
-                self.execute_on_track(item)
-            elif isinstance(item, Album):
-                for track in item.tracks:
-                    self.execute_on_track(track)
+        tracks, files = extract_items(objs)
+        for track in tracks:
+            track_files = getattr(track, "files", [])
+            metadata = getattr(track, "metadata", None)
+            if metadata:
+                fetch_and_apply_lyrics("get", track, track_files, metadata, interactive=False)
+
+        for file in files:
+            parent = getattr(file, "parent", None)
+            track = parent if isinstance(parent, Track) else None
+            fetch_and_apply_lyrics("get", track, [file], file.metadata, interactive=False)
 
 
 class BetterLyricsSearchAction(BaseAction):
     TITLE = "Search lyrics (TTML / LRC) manually with Better Lyrics..."
 
-    def execute_on_track(self, track: Track):
-        files = track.files or list(track.linked_files)
-        if not files:
-            return
-        fetch_and_apply_lyrics("search", track, files, track.metadata, interactive=True)
-
     def callback(self, objs):
-        for item in objs:
-            if isinstance(item, Track):
-                self.execute_on_track(item)
-                break
-            elif isinstance(item, Album) and item.tracks:
-                self.execute_on_track(item.tracks[0])
-                break
+        tracks, files = extract_items(objs)
+        if tracks:
+            track = tracks[0]
+            track_files = getattr(track, "files", [])
+            metadata = getattr(track, "metadata", None)
+            if metadata:
+                fetch_and_apply_lyrics("search", track, track_files, metadata, interactive=True)
+        elif files:
+            file = files[0]
+            parent = getattr(file, "parent", None)
+            track = parent if isinstance(parent, Track) else None
+            fetch_and_apply_lyrics("search", track, [file], file.metadata, interactive=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1278,7 +1353,7 @@ class BetterLyricsOptionsPage(OptionsPage):
         tol_label = QtWidgets.QLabel("Duration tolerance (seconds):", self)
         self.duration_spin = QtWidgets.QSpinBox(self)
         self.duration_spin.setRange(1, 30)
-        self.duration_spin.setValue(4)
+        self.duration_spin.setValue(5)
         tol_h.addWidget(tol_label)
         tol_h.addWidget(self.duration_spin)
         adv_layout.addLayout(tol_h)
@@ -1299,8 +1374,8 @@ class BetterLyricsOptionsPage(OptionsPage):
         self.box.addStretch()
 
     def load(self):
-        api = getattr(self, "api", None) or PluginApi.get_api()
-        cfg = api.plugin_config
+        api = getattr(self, "api", None) or get_plugin_api()
+        cfg = api.plugin_config if api else {}
 
         self.get_on_load.setChecked(bool(cfg.get("betterlyrics_get_on_load", True)))
         self.get_on_save.setChecked(bool(cfg.get("betterlyrics_get_on_save", False)))
@@ -1327,11 +1402,13 @@ class BetterLyricsOptionsPage(OptionsPage):
         if idx >= 0:
             self.source_combo.setCurrentIndex(idx)
 
-        self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 4)))
+        self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 5)))
         self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "")))
 
     def save(self):
-        api = getattr(self, "api", None) or PluginApi.get_api()
+        api = getattr(self, "api", None) or get_plugin_api()
+        if not api:
+            return
         cfg = api.plugin_config
 
         cfg["betterlyrics_get_on_load"] = self.get_on_load.isChecked()
@@ -1363,6 +1440,9 @@ class BetterLyricsOptionsPage(OptionsPage):
 # ---------------------------------------------------------------------------
 def enable(api: PluginApi) -> None:
     """Entry point called when the plugin is enabled in MusicBrainz Picard 3.0+."""
+    global CURRENT_PLUGIN_API
+    CURRENT_PLUGIN_API = api
+
     # Register options with their defaults
     for key, default in PLUGIN_OPTIONS.items():
         api.plugin_config.register_option(key, default)
@@ -1371,11 +1451,16 @@ def enable(api: PluginApi) -> None:
     api.register_file_post_addition_to_track_processor(on_file_added)
     api.register_file_post_save_processor(on_file_saved)
 
-    # Register context menu actions
+    # Register context menu actions for tracks, albums, files and clusters
     api.register_track_action(BetterLyricsSearchAction)
     api.register_album_action(BetterLyricsSearchAction)
+    api.register_file_action(BetterLyricsSearchAction)
+    api.register_cluster_action(BetterLyricsSearchAction)
+
     api.register_track_action(BetterLyricsGetAction)
     api.register_album_action(BetterLyricsGetAction)
+    api.register_file_action(BetterLyricsGetAction)
+    api.register_cluster_action(BetterLyricsGetAction)
 
     # Register options page in preferences
     api.register_options_page(BetterLyricsOptionsPage)
@@ -1383,4 +1468,5 @@ def enable(api: PluginApi) -> None:
 
 def disable() -> None:
     """Cleanup hook called when the plugin is disabled in Picard 3.0+."""
-    pass
+    global CURRENT_PLUGIN_API
+    CURRENT_PLUGIN_API = None
