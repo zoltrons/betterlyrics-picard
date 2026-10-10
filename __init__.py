@@ -535,14 +535,15 @@ def _init_caches() -> None:
 
 
 # ---------------------------------------------------------------------------
-# HTTP Networking Helpers with SSL Fallback
+# HTTP Networking Helpers
 # ---------------------------------------------------------------------------
 def _get_ssl_context():
-    """Returns an SSL context, falling back to unverified if system certs are missing."""
+    """Returns the verified default SSL context used for HTTPS requests."""
     try:
         return ssl.create_default_context()
-    except Exception:
-        return ssl._create_unverified_context()
+    except Exception as e:
+        log.error(f"{PLUGIN_NAME}: Failed to create a verified SSL context: {e}", exc_info=True)
+        raise
 
 
 def _build_url(url: str, params: dict | None) -> str:
@@ -556,11 +557,7 @@ def _build_url(url: str, params: dict | None) -> str:
 
 def _http_get(req, timeout: int):
     """Performs a single HTTP GET. Returns (status, body); raises on network error."""
-    try:
-        resp = urlopen(req, timeout=timeout, context=_get_ssl_context())
-    except Exception:
-        # Retry once with an unverified context to tolerate missing CA bundles.
-        resp = urlopen(req, timeout=timeout, context=ssl._create_unverified_context())
+    resp = urlopen(req, timeout=timeout, context=_get_ssl_context())
     with resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
@@ -764,6 +761,8 @@ class MainThreadDispatcher(QtCore.QObject):
     def __init__(self, poll_ms: int = 100):
         super().__init__()
         self._callbacks: "queue.Queue" = queue.Queue()
+        self._post_lock = threading.Lock()
+        self._stopped = False
         self._last_status: str | None = None
         self._timer = None
         try:
@@ -776,9 +775,18 @@ class MainThreadDispatcher(QtCore.QObject):
 
     def post(self, fn) -> None:
         """Queues a callable to run on the GUI thread (thread-safe)."""
-        self._callbacks.put(fn)
+        with self._post_lock:
+            if not self._stopped:
+                self._callbacks.put(fn)
 
     def stop(self) -> None:
+        with self._post_lock:
+            self._stopped = True
+            while True:
+                try:
+                    self._callbacks.get_nowait()
+                except queue.Empty:
+                    break
         try:
             if self._timer is not None:
                 self._timer.stop()
@@ -1256,20 +1264,29 @@ def save_lyrics_to_files(
     if not primary_tag_content:
         return False
 
-    # Also update track metadata if track is available
-    if track and hasattr(track, "metadata"):
+    def apply_metadata(target) -> bool:
+        """Embeds the selected lyrics in a Picard metadata object."""
+        changed = False
         if config["betterlyrics_embed_lyrics"]:
-            track.metadata["lyrics"] = primary_tag_content
+            target.metadata["lyrics"] = primary_tag_content
+            changed = True
         if config["betterlyrics_embed_ttml_tag"] and ttml_content:
-            track.metadata["ttml"] = ttml_content
+            target.metadata["ttml"] = ttml_content
+            changed = True
         if config["betterlyrics_embed_syncedlyrics"]:
-            track.metadata["syncedlyrics"] = lrc_content or ttml_content
-        if hasattr(track, "update"):
-            track.update()
+            target.metadata["syncedlyrics"] = lrc_content or ttml_content
+            changed = True
+        return changed
 
     if not file_list:
-        return True
+        if track and hasattr(track, "metadata") and apply_metadata(track):
+            if hasattr(track, "update"):
+                track.update()
+            return True
+        return False
 
+    saved_any = False
+    track_metadata_saved = False
     for file in file_list:
         full_path = getattr(file, "filename", None)
         if not full_path:
@@ -1299,21 +1316,24 @@ def save_lyrics_to_files(
             parent = getattr(file, "tagger", None)
             parent_window = getattr(parent, "window", None) if parent else None
             if not confirm_replace(parent_window, title, desc):
-                return False
+                continue
+        elif has_tag_lyrics or has_sidecar:
+            # Automatic saves must never replace existing lyrics unless the
+            # explicit auto-overwrite option is enabled.
+            continue
 
         # 1. Embed Metadata Tags
-        if config["betterlyrics_embed_lyrics"]:
-            file.metadata["lyrics"] = primary_tag_content
+        if apply_metadata(file):
+            # Crucial for Picard: Notify that file has pending metadata changes
+            if hasattr(file, "update"):
+                file.update()
+            saved_any = True
 
-        if config["betterlyrics_embed_ttml_tag"] and ttml_content:
-            file.metadata["ttml"] = ttml_content
-
-        if config["betterlyrics_embed_syncedlyrics"]:
-            file.metadata["syncedlyrics"] = lrc_content or ttml_content
-
-        # Crucial for Picard: Notify that file has pending metadata changes
-        if hasattr(file, "update"):
-            file.update()
+            if track and hasattr(track, "metadata") and not track_metadata_saved:
+                if apply_metadata(track):
+                    if hasattr(track, "update"):
+                        track.update()
+                    track_metadata_saved = True
 
         # 2. Save Sidecar Files (.ttml / .lrc)
         save_ttml = config["betterlyrics_save_ttml_file"] or pref_format in ("ttml", "both")
@@ -1324,6 +1344,7 @@ def save_lyrics_to_files(
                 with open(ttml_sidecar, "w", encoding="utf-8") as f:
                     f.write(ttml_content)
                 log.info(f"{PLUGIN_NAME}: Saved TTML file to {ttml_sidecar}")
+                saved_any = True
             except Exception as err:
                 log.error(f"{PLUGIN_NAME}: Failed to write TTML file {ttml_sidecar}: {err}")
 
@@ -1332,10 +1353,11 @@ def save_lyrics_to_files(
                 with open(lrc_sidecar, "w", encoding="utf-8") as f:
                     f.write(lrc_content)
                 log.info(f"{PLUGIN_NAME}: Saved LRC file to {lrc_sidecar}")
+                saved_any = True
             except Exception as err:
                 log.error(f"{PLUGIN_NAME}: Failed to write LRC file {lrc_sidecar}: {err}")
 
-    return True
+    return saved_any
 
 
 # ---------------------------------------------------------------------------
@@ -1412,6 +1434,16 @@ def show_search_dialog(
 
     current_results = list(initial_results)
 
+    def candidate_for_row(row: int) -> dict | None:
+        """Returns the candidate attached to a table row after sorting."""
+        if row < 0:
+            return None
+        item = table.item(row, 0)
+        if item is None:
+            return None
+        candidate = item.data(Qt.ItemDataRole.UserRole)
+        return candidate if isinstance(candidate, dict) else None
+
     def populate_table(items: list[dict]):
         table.setSortingEnabled(False)
         table.setRowCount(0)
@@ -1421,6 +1453,7 @@ def show_search_dialog(
             idx_item = QtWidgets.QTableWidgetItem()
             idx_item.setTextAlignment(ALIGN_CENTER)
             idx_item.setData(Qt.ItemDataRole.EditRole, row + 1)
+            idx_item.setData(Qt.ItemDataRole.UserRole, item)
             table.setItem(row, 0, idx_item)
 
             timing = item.get("timing_type", "none").lower()
@@ -1477,9 +1510,9 @@ def show_search_dialog(
 
     def on_preview():
         row = table.currentRow()
-        if row < 0 or row >= len(current_results):
+        candidate = candidate_for_row(row)
+        if candidate is None:
             return
-        candidate = current_results[row]
         bundle = resolve_lyrics_bundle(candidate)
         ttml_data = bundle.get("ttml")
         lrc_data = bundle.get("lrc")
@@ -1530,8 +1563,7 @@ def show_search_dialog(
     result = dialog.exec()
     if result == QtWidgets.QDialog.DialogCode.Accepted:
         selected_row = table.currentRow()
-        if 0 <= selected_row < len(current_results):
-            return current_results[selected_row]
+        return candidate_for_row(selected_row)
     return None
 
 
@@ -2108,8 +2140,9 @@ def enable(api: PluginApi) -> None:
     _init_caches()
     _RATE_LIMITER.set_interval(_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0)
     FETCH_QUEUE.configure(_config_int(api, "betterlyrics_max_workers", 3))
-    if _MAIN_INVOKER is None:
-        _MAIN_INVOKER = MainThreadDispatcher()
+    if _MAIN_INVOKER is not None:
+        _MAIN_INVOKER.stop()
+    _MAIN_INVOKER = MainThreadDispatcher()
     FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
     FETCH_QUEUE.start()
 
@@ -2134,11 +2167,14 @@ def enable(api: PluginApi) -> None:
 
 def disable() -> None:
     """Cleanup hook called when the plugin is disabled in Picard 3.0+."""
-    global CURRENT_PLUGIN_API
+    global CURRENT_PLUGIN_API, _MAIN_INVOKER
     if FETCH_QUEUE is not None:
         FETCH_QUEUE.stop()
     if _MAIN_INVOKER is not None:
         _MAIN_INVOKER.stop()
+        _MAIN_INVOKER = None
+    if FETCH_QUEUE is not None:
+        FETCH_QUEUE.set_invoker(None)
     if _HTTP_TEXT_CACHE is not None:
         _HTTP_TEXT_CACHE.clear()
     if _JSON_CACHE is not None:
