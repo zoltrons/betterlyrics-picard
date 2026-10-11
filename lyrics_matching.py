@@ -248,6 +248,13 @@ def assess_match(target: dict, candidate: dict, tolerance: float = 5) -> dict:
         eligible, reason = False, "isrc_conflict"
     else:
         conflict = _gross_metadata_conflict(target, candidate)
+        # An exact ISRC identifies the recording more reliably than an
+        # optional release/version suffix.  Picard often has a bare title
+        # while LRC.red/Apple returns "(Remastered 2011)".  Keep rejecting
+        # artist/title contradictions, but do not reject that benign version
+        # annotation when the ISRC agrees.
+        if exact_isrc and conflict == "version_conflict":
+            conflict = None
         if conflict:
             eligible, reason = False, conflict
         elif target_duration is not None and candidate_duration is not None and abs(target_duration - candidate_duration) > tolerance:

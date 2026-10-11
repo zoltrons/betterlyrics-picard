@@ -118,6 +118,29 @@ class MatchingTests(unittest.TestCase):
             plugin._candidate_is_compatible("Song", "Artist", 180, "USRC12300001", item, 5)
         )
 
+    def test_exact_isrc_allows_provider_version_suffix(self):
+        candidate = {
+            "title": "Bohemian Rhapsody (Remastered 2011)",
+            "artist": "Queen",
+            "album": "A Night at the Opera",
+            "duration": 356.52,
+            "isrc": "GBUM71029604",
+            "metadata_verified": True,
+        }
+        result = plugin.assess_match(
+            {
+                "title": "Bohemian Rhapsody",
+                "artist": "Queen",
+                "album": "A Night at the Opera",
+                "duration": 356,
+                "isrc": "GBUM71029604",
+            },
+            candidate,
+            tolerance=5,
+        )
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["reason"], "exact_isrc")
+
     def test_synced_preference_is_only_a_tie_breaker(self):
         candidates = [
             {"title": "Song", "artist": "Artist", "timing_type": "none"},
