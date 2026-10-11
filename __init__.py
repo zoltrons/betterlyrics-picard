@@ -8,6 +8,8 @@
 # Designed specifically for MusicBrainz Picard 3.0 Plugin v3 Architecture.
 #
 
+from __future__ import annotations
+
 from collections import OrderedDict
 from functools import partial
 import json
@@ -75,9 +77,9 @@ PLUGIN_OPTIONS = {
     "betterlyrics_plain_as_txt": False,
     # Sources & Matching
     "betterlyrics_source": "all",  # all, lrcred, unison, lyricsplus, boidu, lrclib
-    "betterlyrics_enable_lyricsplus": False,
-    "betterlyrics_enable_boidu": False,
-    "betterlyrics_enable_lrclib": False,
+    "betterlyrics_enable_lyricsplus": True,
+    "betterlyrics_enable_boidu": True,
+    "betterlyrics_enable_lrclib": True,
     "betterlyrics_duration_tolerance": 5,  # seconds
     "betterlyrics_api_key": "",
     # Stability / anti-abuse tuning (background fetch queue)
@@ -1126,8 +1128,12 @@ def _candidate_is_compatible(
     tolerance: int,
 ) -> bool:
     """Rejects identity conflicts before lyrics content is downloaded."""
-    if "match_eligible" in item and not item.get("match_eligible"):
-        return False
+    # ``query_all_sources`` already annotates provider results with the
+    # standalone matcher. Do not apply the legacy score floor a second time:
+    # exact provider lookups (notably Boidu and LRCLIB /api/get) can be valid
+    # even when the response has sparse metadata and therefore a low score.
+    if "match_eligible" in item:
+        return bool(item.get("match_eligible"))
     item_isrc = item.get("isrc")
     exact_isrc = _has_exact_isrc(target_isrc, item_isrc)
     normalized_target_isrc = _normalize_isrc(target_isrc)
@@ -1939,17 +1945,33 @@ def _find_best_bundle(
     return None
 
 
-def _apply_auto_bundle(title: str, files, track, bundle: dict | None) -> None:
+def _apply_auto_bundle(method: str, title: str, files, track, bundle: dict | None) -> None:
     """Main-thread consumer: writes a resolved bundle into Picard's data model."""
     if not bundle:
         log.warning(f"{PLUGIN_NAME}: No lyrics found for \"{title}\"")
+        if method == "save":
+            for file in files or []:
+                files_processing.discard(getattr(file, "filename", None))
         return
     try:
         saved = save_lyrics_to_files(files, bundle, track=track, interactive=False)
         if saved:
-            log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
+            if method == "save":
+                # Match the upstream LRCLIB plugin: a save-triggered lookup
+                # must persist the newly embedded metadata to the audio file.
+                for file in files or []:
+                    save = getattr(file, "save", None)
+                    if callable(save):
+                        save()
+                log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
+            else:
+                log.info(f"{PLUGIN_NAME}: Successfully matched and staged TTML/LRC lyrics for \"{title}\"")
     except Exception as e:
         log.error(f"{PLUGIN_NAME}: Failed to apply lyrics for \"{title}\": {e}", exc_info=True)
+    finally:
+        if method == "save":
+            for file in files or []:
+                files_processing.discard(getattr(file, "filename", None))
 
 
 def fetch_and_apply_lyrics(
@@ -1970,12 +1992,12 @@ def fetch_and_apply_lyrics(
 
     if not title:
         log.warning(f"{PLUGIN_NAME}: Cannot fetch lyrics without a track title")
-        return
+        return False
 
     if config["betterlyrics_ignore_instrumental"]:
         if "(instrumental)" in title.lower() or "[instrumental]" in title.lower():
             log.info(f"{PLUGIN_NAME}: Skipping instrumental track: {title}")
-            return
+            return False
 
     if method == "search":
         # Interactive flow: the modal dialog must run on the GUI thread.
@@ -2003,7 +2025,7 @@ def fetch_and_apply_lyrics(
             log.warning(f"{PLUGIN_NAME}: Empty lyrics received for \"{title}\"")
             return
         save_lyrics_to_files(files, bundle, track=track, interactive=interactive)
-        return
+        return True
 
     # Automatic flow: enqueue on the background fetch queue (never blocks the UI).
     _ensure_queue_ready()
@@ -2025,7 +2047,7 @@ def fetch_and_apply_lyrics(
             tolerance,
             prefer_synced,
         ),
-        apply_fn=partial(_apply_auto_bundle, title, files, track),
+        apply_fn=partial(_apply_auto_bundle, method, title, files, track),
         key=_dedup_key(track, files, method),
     )
     if submitted:
@@ -2035,6 +2057,7 @@ def fetch_and_apply_lyrics(
         )
     else:
         log.debug(f"{PLUGIN_NAME}: duplicate lyrics job for \"{title}\" ignored")
+    return submitted
 
 
 # ---------------------------------------------------------------------------
@@ -2080,10 +2103,11 @@ def on_file_saved(api, file=None) -> None:
         parent = getattr(file, "parent", None)
         track = parent if isinstance(parent, Track) else None
         metadata = getattr(track, "metadata", None) or file.metadata
-        fetch_and_apply_lyrics("save", track, [file], metadata, interactive=False)
+        submitted = fetch_and_apply_lyrics("save", track, [file], metadata, interactive=False)
+        if not submitted:
+            files_processing.discard(file.filename)
     except Exception as err:
         log.error(f"{PLUGIN_NAME}: Error in on_file_saved: {err}", exc_info=True)
-    finally:
         files_processing.discard(file.filename)
 
 
@@ -2397,9 +2421,9 @@ class BetterLyricsOptionsPage(OptionsPage):
         if idx >= 0:
             self.source_combo.setCurrentIndex(idx)
 
-        self.enable_lyricsplus.setChecked(bool(cfg.get("betterlyrics_enable_lyricsplus", False)))
-        self.enable_boidu.setChecked(bool(cfg.get("betterlyrics_enable_boidu", False)))
-        self.enable_lrclib.setChecked(bool(cfg.get("betterlyrics_enable_lrclib", False)))
+        self.enable_lyricsplus.setChecked(bool(cfg.get("betterlyrics_enable_lyricsplus", True)))
+        self.enable_boidu.setChecked(bool(cfg.get("betterlyrics_enable_boidu", True)))
+        self.enable_lrclib.setChecked(bool(cfg.get("betterlyrics_enable_lrclib", True)))
 
         self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 5)))
         self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "")))

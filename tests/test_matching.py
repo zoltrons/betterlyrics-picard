@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -118,6 +119,16 @@ class MatchingTests(unittest.TestCase):
             plugin._candidate_is_compatible("Song", "Artist", 180, "USRC12300001", item, 5)
         )
 
+    def test_provider_match_annotation_is_not_rejected_by_legacy_score_floor(self):
+        self.assertTrue(
+            plugin._candidate_is_compatible(
+                "Song", "Artist", 180, "", {
+                    "title": "Song", "artist": "Artist", "score": 0.43,
+                    "match_eligible": True, "match_reason": "provider_query_bound",
+                }, 5
+            )
+        )
+
     def test_exact_isrc_allows_provider_version_suffix(self):
         candidate = {
             "title": "Bohemian Rhapsody (Remastered 2011)",
@@ -184,6 +195,44 @@ class MatchingTests(unittest.TestCase):
             plugin.resolve_lyrics_bundle = original_resolve
         self.assertEqual(bundle["lrc"], "[00:01.00]lyrics")
         self.assertEqual(len(resolved), 2)
+
+    def test_save_triggered_automatic_bundle_embeds_and_saves_file(self):
+        class FakeFile:
+            def __init__(self, filename):
+                self.filename = filename
+                self.metadata = {}
+                self.update_calls = 0
+                self.save_calls = 0
+
+            def update(self):
+                self.update_calls += 1
+
+            def save(self):
+                self.save_calls += 1
+
+        class FakeTrack:
+            def __init__(self):
+                self.metadata = {}
+                self.update_calls = 0
+
+            def update(self):
+                self.update_calls += 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            file = FakeFile(str(Path(directory) / "song.flac"))
+            track = FakeTrack()
+            plugin._apply_auto_bundle(
+                "save",
+                "Song",
+                [file],
+                track,
+                {"ttml": "<tt><body>lyrics</body></tt>", "lrc": "[00:01.00]lyrics"},
+            )
+            self.assertEqual(file.metadata["lyrics"], "<tt><body>lyrics</body></tt>")
+            self.assertEqual(file.metadata["ttml"], "<tt><body>lyrics</body></tt>")
+            self.assertGreaterEqual(file.update_calls, 1)
+            self.assertEqual(file.save_calls, 1)
+            self.assertEqual(track.metadata["lyrics"], "<tt><body>lyrics</body></tt>")
 
 
 if __name__ == "__main__":

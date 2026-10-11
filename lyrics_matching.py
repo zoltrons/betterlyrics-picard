@@ -243,7 +243,29 @@ def assess_match(target: dict, candidate: dict, tolerance: float = 5) -> dict:
     reason = ""
     eligible = True
     if not _verified(candidate.get("metadata_verified", True)):
-        eligible, reason = False, "metadata_unverified"
+        # Boidu's public cache endpoint is keyed by the exact title/artist/
+        # duration query but often returns only TTML, without metadata. Treat
+        # that narrow provider contract as evidence, not as a generic bypass.
+        query_bound = bool(candidate.get("query_bound"))
+        provider_confidence = candidate.get("provider_confidence")
+        if (
+            query_bound
+            and candidate.get("provider_id") == "boidu"
+            and _strong_text(target.get("title"), candidate.get("title"))
+            and _strong_text(target.get("artist"), candidate.get("artist"))
+        ):
+            eligible, reason = True, "provider_query_bound"
+        elif (
+            candidate.get("exact_lookup")
+            and candidate.get("provider_id") == "lrclib"
+            and _strong_text(target.get("title"), candidate.get("title"))
+            and _strong_text(target.get("artist"), candidate.get("artist"))
+        ):
+            eligible, reason = True, "provider_exact_lookup"
+        elif isinstance(provider_confidence, (int, float)) and provider_confidence >= 0.80:
+            eligible, reason = True, "provider_confidence"
+        else:
+            eligible, reason = False, "metadata_unverified"
     elif target_isrcs and candidate_isrcs and not common_isrcs:
         eligible, reason = False, "isrc_conflict"
     else:

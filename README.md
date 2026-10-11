@@ -14,9 +14,9 @@ Designed for **MusicBrainz Picard 3.0+** using the modern **Plugin v3** architec
 - **Lyrics Providers**:
   - **LRC.red API**: Primary synced lyrics catalog used by Better Lyrics.
   - **Unison API**: Official crowdsourced community database of Better Lyrics.
-  - **LyricsPlus KPOE v2**: Optional Apple-compatible word / syllable-timed lyrics.
-  - **Better Lyrics API / Boidu**: Optional cache-aware TTML fallback.
-  - **LRCLIB**: Optional line-synced fallback.
+  - **LyricsPlus KPOE v2**: Apple-compatible word / syllable-timed lyrics.
+  - **Better Lyrics API / Boidu**: Public Boidu cache-backed TTML fallback, with the protected Better Lyrics API available when a key is supplied.
+  - **LRCLIB**: Line-synced fallback.
 - **Smart Match Scoring**: Ranks results with explicit identity weights (ISRC 35%, title 30%, artist 15%, album 5%, duration 15%), strict duration tolerance (default ±5s), and exact MusicBrainz ISRC matching. Empty metadata never receives a false bonus, and a failed lyrics endpoint falls back to the next compatible candidate.
 - **Background Fetch Queue**: Non-blocking worker pool fetches lyrics off the UI thread, so loading large albums never freezes Picard. Identical in-flight jobs are de-duplicated, transient failures (HTTP 429/5xx, network errors) are retried with exponential backoff, and successful responses are cached to reduce repeat lookups.
 - **Rate Limiting / Anti-Abuse**: A configurable minimum delay between outbound requests paces the whole queue, preventing burst traffic and API rate-limit (`429`) responses.
@@ -75,20 +75,20 @@ Settings are available under **Options -> Plugins -> Better Lyrics**:
 | **Search when saving files** | `Disabled` | Automatically queries for lyrics when saving files. |
 | **Auto overwrite existing lyrics** | `Disabled` | Overwrites existing tags and sidecars without prompting. |
 | **Primary Source** | `All Sources` | Select `All Sources (Smart Hybrid)`, `LRC.red`, or `Unison`. |
-| **LyricsPlus word/syllable fallback** | `Disabled` | Enables the KPOE v2 LyricsPlus adapter. Off by default because it uses a third-party public service. |
-| **Better Lyrics API / Boidu fallback** | `Disabled` | Enables the Better Lyrics API fallback. Add only your own authorized API key when uncached requests require one. |
-| **LRCLIB fallback** | `Disabled` | Enables the line-synced LRCLIB fallback. |
+| **LyricsPlus word/syllable fallback** | `Enabled` | Enables the KPOE v2 LyricsPlus adapter. |
+| **Better Lyrics API / Boidu fallback** | `Enabled` | Uses Boidu's public cache endpoint without a key; add only your own authorized key when using the protected Better Lyrics API. |
+| **LRCLIB fallback** | `Enabled` | Enables the line-synced LRCLIB fallback. |
 | **Duration tolerance (seconds)** | `5` | Maximum allowable difference between audio track length and lyric duration. |
 | **Max parallel requests** | `3` | Number of background worker threads used to fetch lyrics concurrently (higher = faster, more bandwidth). |
 | **Minimum delay between requests (ms)** | `200` | Minimum spacing between outbound HTTP requests across all workers. Prevents API abuse and `429` rate-limiting (`0` disables pacing). |
-| **Better Lyrics API Key** | *(empty)* | Optional API key for `api.betterlyrics.org`. |
+| **Better Lyrics API Key** | *(empty)* | Optional authorized API key for `api.betterlyrics.org`; the keyless default uses `lyrics-api.boidu.dev`. |
 
 ---
 
 ## Usage
 
 ### Automatic Tagging
-When you load albums or tracks into Picard, Better Lyrics automatically matches the track against available databases, retrieves the best match based on duration and ISRC, and writes the lyrics according to your configuration.
+When you load albums or tracks into Picard, Better Lyrics automatically matches the track against available databases, retrieves the best match based on duration and ISRC, and stages the configured lyrics tags in Picard. Save the file in Picard to embed the staged metadata. To fetch and persist lyrics automatically after each file save, enable **Search when saving files**; that path calls Picard's file save after embedding the new metadata.
 
 ### Manual Actions
 Right-click any track or album in Picard's selection view:

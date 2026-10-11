@@ -89,7 +89,11 @@ def _boidu(target: Mapping[str, Any], request_json: RequestJSON, endpoint: str, 
         return _result("not_found", [], "title and artist are required")
     if duration is None or duration <= 0:
         return _result("not_found", [], "boidu requires track duration")
-    url = _endpoint(endpoint, "https://api.betterlyrics.org", "/getLyrics")
+    # Boidu's public cache endpoint is separate from Better Lyrics' protected
+    # API. Use the public endpoint without a key; use the canonical API only
+    # when the user explicitly supplied an authorized key.
+    default_base = "https://api.betterlyrics.org" if api_key else "https://lyrics-api.boidu.dev"
+    url = _endpoint(endpoint, default_base, "/getLyrics")
     if not url:
         return _result("invalid_response", [], "provider endpoint must be HTTPS")
     manual_override = _query_override(target)
@@ -137,7 +141,14 @@ def _lrclib(target: Mapping[str, Any], request_json: RequestJSON, endpoint: str,
             params["duration"] = _decimal(duration)
         exact = _call(request_json, _lrclib_path(base, "get"), params, headers)
         if exact[0] == "hit":
-            candidates, error = _parse_lrclib_body(exact[1], target, title, artist)
+            # Match picard-lrclib: /api/get is an exact provider lookup, and a
+            # response without an id is treated as a miss before falling back
+            # to the broader search endpoint.
+            body = exact[1]
+            if not isinstance(body, dict) or not body.get("id"):
+                candidates, error = [], None
+            else:
+                candidates, error = _parse_lrclib_body(body, target, title, artist, exact_lookup=True)
             if error:
                 return _result("invalid_response", [], error)
             if candidates:
@@ -219,6 +230,7 @@ def _parse_boidu(body: Any, target: Mapping[str, Any], title: str, artist: str) 
     actual_album = _metadata_text(metadata, ("album", "albumName"))
     actual_duration = _metadata_duration(metadata)
     actual_isrc = _valid_isrc(_metadata_value(metadata, ("isrc", "songISRC", "trackIsrc")))
+    confidence = _number(body.get("score"))
     return _candidate(
         title=actual_title or title,
         artist=actual_artist or artist,
@@ -232,12 +244,21 @@ def _parse_boidu(body: Any, target: Mapping[str, Any], title: str, artist: str) 
         direct_lyrics=text,
         payload=body,
         raw=body,
-        timing_type="line" if fmt in ("ttml", "lrc") else "none",
+        timing_type=("word" if fmt == "ttml" and "<span" in text.lower() else "line") if fmt in ("ttml", "lrc") else "none",
         metadata_verified=bool(actual_title and actual_artist),
+        query_bound=not bool(actual_title and actual_artist),
+        provider_confidence=confidence,
     ), None
 
 
-def _parse_lrclib_body(body: Any, target: Mapping[str, Any], fallback_title: str = "", fallback_artist: str = "") -> tuple[list[dict], str | None]:
+def _parse_lrclib_body(
+    body: Any,
+    target: Mapping[str, Any],
+    fallback_title: str = "",
+    fallback_artist: str = "",
+    *,
+    exact_lookup: bool = False,
+) -> tuple[list[dict], str | None]:
     if isinstance(body, dict):
         records = [body]
     elif isinstance(body, list):
@@ -279,6 +300,7 @@ def _parse_lrclib_body(body: Any, target: Mapping[str, Any], fallback_title: str
             raw=record,
             timing_type="line" if synced else "none",
             metadata_verified=bool(actual_title and actual_artist),
+            exact_lookup=exact_lookup,
         ))
     return output, None
 
@@ -293,6 +315,9 @@ def _candidate(**values: Any) -> dict:
         "format": values.get("format"), "direct_lyrics": values.get("direct_lyrics"),
         "payload": values.get("payload"), "raw": values.get("raw"),
         "timing_type": values.get("timing_type"), "metadata_verified": bool(values.get("metadata_verified")),
+        "query_bound": bool(values.get("query_bound")),
+        "provider_confidence": values.get("provider_confidence"),
+        "exact_lookup": bool(values.get("exact_lookup")),
     }
     return copy.deepcopy(result)
 
