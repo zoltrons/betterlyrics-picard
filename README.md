@@ -15,7 +15,7 @@ Designed for **MusicBrainz Picard 3.0+** using the modern **Plugin v3** architec
   - **LRC.red API**: Primary synced lyrics catalog used by Better Lyrics.
   - **Unison API**: Official crowdsourced community database of Better Lyrics.
   - **Better Lyrics API**: Optional support for custom API keys.
-- **Smart Match Scoring**: Ranks results using title and artist fuzzy matching (`SequenceMatcher`), album identity, duration tolerance (default ±4s), and exact MusicBrainz ISRC matching.
+- **Smart Match Scoring**: Ranks results with explicit identity weights (ISRC 35%, title 30%, artist 15%, album 5%, duration 15%), strict duration tolerance (default ±5s), and exact MusicBrainz ISRC matching. Empty metadata never receives a false bonus, and a failed lyrics endpoint falls back to the next compatible candidate.
 - **Background Fetch Queue**: Non-blocking worker pool fetches lyrics off the UI thread, so loading large albums never freezes Picard. Identical in-flight jobs are de-duplicated, transient failures (HTTP 429/5xx, network errors) are retried with exponential backoff, and successful responses are cached to reduce repeat lookups.
 - **Rate Limiting / Anti-Abuse**: A configurable minimum delay between outbound requests paces the whole queue, preventing burst traffic and API rate-limit (`429`) responses.
 - **Interactive Search Dialog**: Right-click any track or album to search manually, view results in a detailed table (title, artist, album, duration, sync type, source), and inspect lyrics with side-by-side TTML/LRC preview before applying.
@@ -36,26 +36,19 @@ Designed for **MusicBrainz Picard 3.0+** using the modern **Plugin v3** architec
    ```
 4. Click **Install**. Picard will clone the repository, read `MANIFEST.toml`, and enable the plugin.
 
-### Option 2: Clone directly into plugins directory
+### Option 2: Install from a local checkout (developers)
 
-Clone this repository into Picard's plugin directory:
+Use Picard's Plugin v3 installer so the repository and `MANIFEST.toml` are
+registered through the supported lifecycle:
 
-#### macOS
 ```bash
-git clone https://github.com/zoltrons/betterlyrics-picard.git ~/Library/Preferences/MusicBrainz/Picard/plugins/betterlyrics-picard
+picard-cli plugins install /path/to/betterlyrics-picard
 ```
 
-#### Windows (PowerShell)
-```powershell
-git clone https://github.com/zoltrons/betterlyrics-picard.git "$env:APPDATA\MusicBrainz\Picard\plugins\betterlyrics-picard"
-```
-
-#### Linux
-```bash
-git clone https://github.com/zoltrons/betterlyrics-picard.git ~/.config/MusicBrainz/Picard/plugins/betterlyrics-picard
-```
-
-Restart or reload Picard, open **Options -> Plugins**, and ensure **Better Lyrics** is enabled.
+For a non-git local copy, use the Plugin v3 local-install option supported by
+your Picard version rather than copying files into the legacy `plugins/`
+directory. Restart or reload Picard, open **Options -> Plugins**, and ensure
+**Better Lyrics** is enabled.
 
 ---
 
@@ -78,7 +71,7 @@ Settings are available under **Options -> Plugins -> Better Lyrics**:
 | **Search when saving files** | `Disabled` | Automatically queries for lyrics when saving files. |
 | **Auto overwrite existing lyrics** | `Disabled` | Overwrites existing tags and sidecars without prompting. |
 | **Primary Source** | `All Sources` | Select `All Sources (Smart Hybrid)`, `LRC.red`, or `Unison`. |
-| **Duration tolerance (seconds)** | `4` | Maximum allowable difference between audio track length and lyric duration. |
+| **Duration tolerance (seconds)** | `5` | Maximum allowable difference between audio track length and lyric duration. |
 | **Max parallel requests** | `3` | Number of background worker threads used to fetch lyrics concurrently (higher = faster, more bandwidth). |
 | **Minimum delay between requests (ms)** | `200` | Minimum spacing between outbound HTTP requests across all workers. Prevents API abuse and `429` rate-limiting (`0` disables pacing). |
 | **Better Lyrics API Key** | *(empty)* | Optional API key for `api.betterlyrics.org`. |

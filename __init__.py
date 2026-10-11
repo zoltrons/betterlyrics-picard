@@ -74,6 +74,20 @@ UNISON_API_URL = "https://unison.betterlyrics.org/lyrics"
 UNISON_SEARCH_URL = "https://unison.betterlyrics.org/lyrics/search"
 BETTER_LYRICS_API_URL = "https://api.betterlyrics.org/getLyrics"
 
+# Matching weights deliberately sum to 1.0.  ISRC is the strongest identity
+# signal, while title/artist remain the primary fallback when an API result has
+# no ISRC.  Duration is useful for disambiguation, but must not overpower an
+# otherwise exact title/artist match.
+MATCH_WEIGHTS = {
+    "isrc": 0.35,
+    "title": 0.30,
+    "artist": 0.15,
+    "album": 0.05,
+    "duration": 0.15,
+}
+MATCH_MIN_SCORE_WITHOUT_ISRC = 0.40
+SYNCED_TIMING_TYPES = frozenset(("word", "line", "richsync", "linesync"))
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/131.0.0.0 Safari/537.36 MusicBrainzPicard-BetterLyrics/1.2"
@@ -671,12 +685,11 @@ def fetch_text(
 # ---------------------------------------------------------------------------
 # Main-Thread Bridge & Background Fetch Queue (stability + anti-abuse)
 # ---------------------------------------------------------------------------
-def _get_main_window():
+def _get_main_window(api: PluginApi | None = None):
     """Best-effort lookup of Picard's main window (GUI only)."""
     try:
-        from picard import tagger_instance
-
-        tagger = tagger_instance()
+        api = api or get_plugin_api()
+        tagger = getattr(api, "tagger", None) if api is not None else None
         window = getattr(tagger, "window", None)
         if window is not None:
             return window
@@ -967,6 +980,46 @@ class FetchQueue:
 # ---------------------------------------------------------------------------
 # Match Scoring Algorithm
 # ---------------------------------------------------------------------------
+def _normalize_match_text(value) -> str:
+    """Normalizes metadata enough for stable, punctuation-insensitive matching."""
+    text = str(value or "").casefold()
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    return " ".join(text.split())
+
+
+def _text_similarity(left, right) -> float:
+    left_normalized = _normalize_match_text(left)
+    right_normalized = _normalize_match_text(right)
+    if not left_normalized or not right_normalized:
+        return 0.0
+    return SequenceMatcher(None, left_normalized, right_normalized).ratio()
+
+
+def _normalize_isrc(value) -> str:
+    """Normalizes ISRC formatting without changing its identity."""
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _duration_similarity(target_duration: int, item_duration: int, tolerance: int) -> float:
+    """Returns a duration score that reaches zero outside twice the tolerance."""
+    if target_duration <= 0 or item_duration <= 0:
+        return 0.0
+    diff = abs(target_duration - item_duration)
+    tolerance = max(0, int(tolerance))
+    if tolerance == 0:
+        return 1.0 if diff == 0 else 0.0
+    if diff <= tolerance:
+        # A small duration drift is expected, but an exact duration still wins.
+        return 1.0 - 0.4 * (diff / tolerance)
+    return max(0.0, 0.6 * (1.0 - ((diff - tolerance) / tolerance)))
+
+
+def _has_exact_isrc(target_isrc: str | None, item_isrc: str | None) -> bool:
+    target = _normalize_isrc(target_isrc)
+    item = _normalize_isrc(item_isrc)
+    return bool(target and item and target == item)
+
+
 def calculate_match_score(
     target_title: str,
     target_artist: str,
@@ -974,63 +1027,80 @@ def calculate_match_score(
     target_duration: int,
     target_isrc: str | None,
     item: dict,
+    duration_tolerance: int = 5,
 ) -> float:
-    """Calculates a match confidence score between 0.0 and 1.0."""
+    """Calculates a weighted match confidence score between 0.0 and 1.0.
+
+    Missing metadata contributes zero rather than receiving a false bonus.  A
+    synchronized result is intentionally not part of this identity score; it
+    is a preference-only tie breaker in :func:`query_all_sources`.
+    """
     item_title = item.get("title", "")
     item_artist = item.get("artist", "")
     item_album = item.get("album", "")
-    item_duration = item.get("duration", 0)
+    item_duration = parse_duration(item.get("duration", 0))
     item_isrc = item.get("isrc")
-    item_timing = item.get("timing_type", "none")
 
     score = 0.0
 
-    # 1. ISRC Exact Match (Massive confidence boost)
-    if target_isrc and item_isrc and target_isrc.strip().upper() == item_isrc.strip().upper():
-        score += 0.50
+    if _has_exact_isrc(target_isrc, item_isrc):
+        score += MATCH_WEIGHTS["isrc"]
 
-    # 2. Title Similarity
     if target_title and item_title:
-        t_ratio = SequenceMatcher(
-            None, target_title.lower().strip(), item_title.lower().strip()
-        ).ratio()
-        score += t_ratio * 0.40
-    else:
-        score += 0.20
+        score += _text_similarity(target_title, item_title) * MATCH_WEIGHTS["title"]
 
-    # 3. Artist Similarity
     if target_artist and item_artist:
-        a_ratio = SequenceMatcher(
-            None, target_artist.lower().strip(), item_artist.lower().strip()
-        ).ratio()
-        score += a_ratio * 0.30
-    else:
-        score += 0.15
+        score += _text_similarity(target_artist, item_artist) * MATCH_WEIGHTS["artist"]
 
-    # 4. Album Similarity
     if target_album and item_album:
-        al_ratio = SequenceMatcher(
-            None, target_album.lower().strip(), item_album.lower().strip()
-        ).ratio()
-        score += al_ratio * 0.10
+        score += _text_similarity(target_album, item_album) * MATCH_WEIGHTS["album"]
 
-    # 5. Duration Difference Match
-    if target_duration > 0 and item_duration > 0:
-        diff = abs(target_duration - item_duration)
-        if diff <= 2:
-            score += 0.20
-        elif diff <= 5:
-            score += 0.15
-        elif diff <= 10:
-            score += 0.05
-        elif diff > 30:
-            score -= 0.15
-
-    # 6. Prefer Synced / TTML Lyrics
-    if item_timing in ("word", "line", "richsync", "linesync"):
-        score += 0.05
+    if target_duration and item_duration:
+        score += _duration_similarity(
+            parse_duration(target_duration), item_duration, duration_tolerance
+        ) * MATCH_WEIGHTS["duration"]
 
     return max(0.0, min(1.0, score))
+
+
+def _candidate_is_compatible(
+    target_title: str,
+    target_artist: str,
+    target_duration: int,
+    target_isrc: str,
+    item: dict,
+    tolerance: int,
+) -> bool:
+    """Rejects identity conflicts before lyrics content is downloaded."""
+    item_isrc = item.get("isrc")
+    exact_isrc = _has_exact_isrc(target_isrc, item_isrc)
+    normalized_target_isrc = _normalize_isrc(target_isrc)
+    normalized_item_isrc = _normalize_isrc(item_isrc)
+
+    if normalized_target_isrc and normalized_item_isrc and not exact_isrc:
+        return False
+
+    # An exact ISRC is authoritative. Providers may format title/artist
+    # metadata differently, so text gates are only applied when ISRC is absent.
+    item_title = item.get("title", "")
+    item_artist = item.get("artist", "")
+    if not exact_isrc:
+        if target_title and not item_title:
+            return False
+        if target_artist and not item_artist:
+            return False
+        if target_title and _text_similarity(target_title, item_title) < 0.55:
+            return False
+        if target_artist and _text_similarity(target_artist, item_artist) < 0.45:
+            return False
+        if item.get("score", 0.0) < MATCH_MIN_SCORE_WITHOUT_ISRC:
+            return False
+
+    item_duration = parse_duration(item.get("duration", 0))
+    if target_duration > 0 and item_duration > 0:
+        if abs(target_duration - item_duration) > max(0, int(tolerance)) and not exact_isrc:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1138,9 +1208,16 @@ def query_all_sources(
     isrc: str = "",
     query: str = "",
     source_preference: str = "all",
+    duration_tolerance: int | None = None,
+    prefer_synced: bool | None = None,
 ) -> list[dict]:
     """Queries LRC.red, Unison, or both according to user preferences."""
     results = []
+
+    if duration_tolerance is None:
+        duration_tolerance = _config_int(get_plugin_api(), "betterlyrics_duration_tolerance", 5)
+    if prefer_synced is None:
+        prefer_synced = bool(config["betterlyrics_prefer_synced"])
 
     pref = source_preference or "all"
     if pref not in ("all", "lrcred", "unison"):
@@ -1153,9 +1230,23 @@ def query_all_sources(
         results.extend(search_unison(title, artist, album, duration, query))
 
     for item in results:
-        item["score"] = calculate_match_score(title, artist, album, duration, isrc, item)
+        item["score"] = calculate_match_score(
+            title,
+            artist,
+            album,
+            duration,
+            isrc,
+            item,
+            duration_tolerance=duration_tolerance,
+        )
 
-    results.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+    results.sort(
+        key=lambda x: (
+            x.get("score", 0.0),
+            1 if prefer_synced and x.get("timing_type") in SYNCED_TIMING_TYPES else 0,
+        ),
+        reverse=True,
+    )
     return results
 
 
@@ -1604,6 +1695,7 @@ def _find_best_bundle(
     source_pref: str,
     clean_words: bool,
     tolerance: int,
+    prefer_synced: bool,
 ) -> dict | None:
     """Worker-thread body: query providers, pick the best match, resolve lyrics.
 
@@ -1618,6 +1710,8 @@ def _find_best_bundle(
             duration=length,
             isrc=isrc,
             source_preference=source_pref,
+            duration_tolerance=tolerance,
+            prefer_synced=prefer_synced,
         )
     except Exception as e:
         log.warning(f"{PLUGIN_NAME}: search failed for \"{title}\": {e}")
@@ -1626,27 +1720,26 @@ def _find_best_bundle(
     if not candidates:
         return None
 
-    best = candidates[0]
-    if length > 0 and best.get("duration", 0) > 0:
-        diff = abs(length - best["duration"])
-        # If duration mismatch is large and title/artist score is weak, skip.
-        if diff > (tolerance + 5) and best.get("score", 0.0) < 0.50:
+    # A high-scoring result is not useful if its lyrics endpoint is empty or
+    # unavailable.  Try the next compatible candidate instead of failing the
+    # whole track on the first provider result.
+    for candidate in candidates:
+        if not _candidate_is_compatible(title, artist, length, isrc, candidate, tolerance):
+            continue
+        try:
+            bundle = resolve_lyrics_bundle(candidate, clean_words=clean_words)
+        except Exception as e:
             log.warning(
-                f"{PLUGIN_NAME}: Best match \"{best.get('title')}\" duration difference "
-                f"({diff}s) exceeds tolerance ({tolerance}s) with low score "
-                f"({best.get('score', 0):.2f})"
+                f"{PLUGIN_NAME}: failed to resolve lyrics candidate "
+                f"\"{candidate.get('title')}\" for \"{title}\": {e}"
             )
-            return None
+            continue
 
-    try:
-        bundle = resolve_lyrics_bundle(best, clean_words=clean_words)
-    except Exception as e:
-        log.warning(f"{PLUGIN_NAME}: failed to resolve lyrics for \"{title}\": {e}")
-        return None
+        if bundle.get("ttml") or bundle.get("lrc"):
+            return bundle
 
-    if not bundle.get("ttml") and not bundle.get("lrc"):
-        return None
-    return bundle
+    log.warning(f"{PLUGIN_NAME}: no compatible lyrics candidate resolved for \"{title}\"")
+    return None
 
 
 def _apply_auto_bundle(title: str, files, track, bundle: dict | None) -> None:
@@ -1697,6 +1790,8 @@ def fetch_and_apply_lyrics(
             duration=length,
             isrc=isrc,
             source_preference=config["betterlyrics_source"],
+            duration_tolerance=int(config["betterlyrics_duration_tolerance"]),
+            prefer_synced=bool(config["betterlyrics_prefer_synced"]),
         )
         parent_win = QtWidgets.QApplication.activeWindow()
         selected_candidate = show_search_dialog(
@@ -1718,10 +1813,20 @@ def fetch_and_apply_lyrics(
     source_pref = config["betterlyrics_source"]
     clean_words = bool(config["betterlyrics_clean_word_timestamps"])
     tolerance = int(config["betterlyrics_duration_tolerance"])
+    prefer_synced = bool(config["betterlyrics_prefer_synced"])
 
     submitted = FETCH_QUEUE.submit(
         job_fn=partial(
-            _find_best_bundle, title, artist, album_name, length, isrc, source_pref, clean_words, tolerance
+            _find_best_bundle,
+            title,
+            artist,
+            album_name,
+            length,
+            isrc,
+            source_pref,
+            clean_words,
+            tolerance,
+            prefer_synced,
         ),
         apply_fn=partial(_apply_auto_bundle, title, files, track),
         key=_dedup_key(track, files, method),
