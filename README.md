@@ -90,6 +90,20 @@ Settings are available under **Options -> Plugins -> Better Lyrics**:
 ### Automatic Tagging
 When you load albums or tracks into Picard, Better Lyrics automatically matches the track against available databases, retrieves the best match based on duration and ISRC, and stages the configured lyrics tags in Picard. Save the file in Picard to embed the staged metadata. To fetch and persist lyrics automatically after each file save, enable **Search when saving files**; that path calls Picard's file save after embedding the new metadata.
 
+Automatic matching retains ISRC and recording-version checks. Without a target
+ISRC, otherwise ambiguous releases can select one deterministic candidate only
+when title, artist (including featured credits), album, and known duration agree.
+Featured credits can move between the title and artist fields without rejecting
+the recording. Distinct ISRCs are not merged into one lyrics document.
+
+Existing content is protected **per destination**: a `.ttml` sidecar no longer
+blocks filling an empty `lyrics` tag, and an existing `lyrics` tag does not block
+an empty enabled `ttml` tag. To replace existing tags or sidecars, explicitly
+enable **Auto overwrite existing lyrics**. The sidecar checkboxes control file
+creation independently of the preferred embedded format. Logs distinguish
+rejected matches, protected/unchanged destinations, staged tags, and requested
+audio saves; a requested save is not reported as completed before its callback.
+
 ### Manual Actions
 Right-click any track or album in Picard's selection view:
 - **Plugins -> Get lyrics (TTML / LRC) automatically with Better Lyrics**: Executes the scoring and matching pipeline for the selected item(s).

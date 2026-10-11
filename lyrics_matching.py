@@ -16,6 +16,8 @@ from typing import Any, Iterable, Mapping
 
 _ISRC_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
 _ISRC_SPLIT_RE = re.compile(r"[;,]")
+_FEATURE_GROUP_RE = re.compile(r"[\[(]\s*(?:feat\.?|ft\.?|featuring)\s+([^\[\]()]+)[\])]", re.IGNORECASE)
+_FEATURE_SUFFIX_RE = re.compile(r"\s+(?:feat\.?|ft\.?|featuring)\s+(.+)$", re.IGNORECASE)
 
 # These are deliberately retained by normalize_text.  They are extracted
 # separately so that "Title", "Title (Live)", and "Title (Remix)" do not
@@ -150,23 +152,55 @@ def _strong_text(left: Any, right: Any) -> bool:
     )
 
 
+def _recording_text(item: Mapping[str, Any]) -> tuple[str, str, frozenset[str]]:
+    """Move explicit feature credits into shared evidence; never discard guests.
+
+    Only explicit feat/ft/featuring annotations are movable. Primary artists
+    and unlabelled collaborations remain intact, as do all version labels.
+    """
+
+    guests: set[str] = set()
+    fields = []
+    for field in ("title", "artist"):
+        text = unicodedata.normalize("NFKC", str(item.get(field) or ""))
+
+        def take_credit(match: re.Match) -> str:
+            guests.add(normalize_text(match.group(1)))
+            return " "
+
+        text = _FEATURE_GROUP_RE.sub(take_credit, text)
+        text = _FEATURE_SUFFIX_RE.sub(take_credit, text)
+        fields.append(normalize_text(text))
+    return fields[0], fields[1], frozenset(guests)
+
+
 def _version_signature(item: Mapping[str, Any]) -> frozenset[str]:
-    text = " ".join(normalize_text(item.get(field, "")) for field in ("title", "album"))
+    text = " ".join((_recording_text(item)[0], normalize_text(item.get("album"))))
     return frozenset(name for name, pattern in _VERSION_PATTERNS if pattern.search(text))
 
 
 def _versions_compatible(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
     a, b = _version_signature(left), _version_signature(right)
-    if a and b and a != b:
+    if a != b:
         return False
-    left_title = normalize_text(left.get("title"))
-    right_title = normalize_text(right.get("title"))
+    left_title = _recording_text(left)[0]
+    right_title = _recording_text(right)[0]
     # Named remixes, live venues, and edit labels matter too, not just the
     # generic "remix"/"live" category.  Keep full version-bearing titles.
     has_title_version = any(pattern.search(left_title) or pattern.search(right_title) for _, pattern in _VERSION_PATTERNS)
     if has_title_version and left_title and right_title:
         return left_title == right_title
     return True
+
+
+def _benign_remaster_annotation(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    # Preserve the established exact-ISRC remaster exception, but never extend
+    # it to live/remix/edit versions or arbitrary changed title words.
+    if (_version_signature(left) ^ _version_signature(right)) - {"remaster"}:
+        return False
+    suffix = r"\s+re\s?master(?:ed)?(?:\s+\d{4})?$"
+    a, b = _recording_text(left)[0], _recording_text(right)[0]
+    return bool(a and b and re.sub(suffix, "", a) == re.sub(suffix, "", b))
 
 
 def _duration_score(left: float | None, right: float | None, tolerance: float) -> float:
@@ -186,10 +220,12 @@ def _identity(target: Mapping[str, Any], candidate: Mapping[str, Any]) -> str:
         return "isrc:" + ",".join(common)
     if candidate_isrcs:
         return "isrc:" + ",".join(sorted(candidate_isrcs))
+    title, artist, guests = _recording_text(candidate)
     return "meta:" + "|".join(
         (
-            normalize_text(candidate.get("title", "")),
-            normalize_text(candidate.get("artist", "")),
+            title,
+            artist,
+            ",".join(sorted(guests)),
             normalize_text(candidate.get("album", "")),
             ",".join(sorted(_version_signature(candidate))),
         )
@@ -197,9 +233,13 @@ def _identity(target: Mapping[str, Any], candidate: Mapping[str, Any]) -> str:
 
 
 def _gross_metadata_conflict(target: Mapping[str, Any], candidate: Mapping[str, Any]) -> str | None:
-    if target.get("title") and candidate.get("title") and _similarity(target["title"], candidate["title"]) < 0.45:
+    title, artist, guests = _recording_text(target)
+    other_title, other_artist, other_guests = _recording_text(candidate)
+    if guests != other_guests:
+        return "artist_conflict"
+    if title and other_title and _similarity(title, other_title) < 0.45:
         return "title_conflict"
-    if target.get("artist") and candidate.get("artist") and _similarity(target["artist"], candidate["artist"]) < 0.45:
+    if artist and other_artist and _similarity(artist, other_artist) < 0.45:
         return "artist_conflict"
     if not _versions_compatible(target, candidate):
         return "version_conflict"
@@ -210,9 +250,10 @@ def assess_match(target: dict, candidate: dict, tolerance: float = 5) -> dict:
     """Assess whether *candidate* can represent *target*.
 
     A candidate without duration is eligible only with an exact valid ISRC, or
-    with strong title+artist evidence and a matching album.  Explicitly
-    unverified provider metadata is never auto-accepted.  An exact ISRC still
-    has to pass gross title/artist, version, and known-duration conflict checks.
+    with strong title+artist evidence and a matching album. Unverified metadata
+    requires a supported Boidu/LRCLIB query contract. Known conflicts override
+    those contracts. An exact ISRC still has to pass gross title/artist and
+    duration checks; its version exception is limited to remaster annotations.
     """
 
     target = target if isinstance(target, Mapping) else {}
@@ -222,8 +263,10 @@ def assess_match(target: dict, candidate: dict, tolerance: float = 5) -> dict:
     candidate_isrcs = normalize_isrcs(candidate.get("isrc"))
     common_isrcs = target_isrcs & candidate_isrcs
     exact_isrc = bool(common_isrcs)
-    title_score = _similarity(target.get("title"), candidate.get("title"))
-    artist_score = _similarity(target.get("artist"), candidate.get("artist"))
+    title, artist, _ = _recording_text(target)
+    other_title, other_artist, _ = _recording_text(candidate)
+    title_score = _similarity(title, other_title)
+    artist_score = _similarity(artist, other_artist)
     album_score = _similarity(target.get("album"), candidate.get("album"))
     target_duration = parse_duration(target.get("duration"))
     candidate_duration = parse_duration(candidate.get("duration"))
@@ -242,50 +285,45 @@ def assess_match(target: dict, candidate: dict, tolerance: float = 5) -> dict:
 
     reason = ""
     eligible = True
-    if not _verified(candidate.get("metadata_verified", True)):
+    conflict = _gross_metadata_conflict(target, candidate)
+    verified = _verified(candidate.get("metadata_verified", True))
+    if verified and exact_isrc and conflict == "version_conflict" and _benign_remaster_annotation(target, candidate):
+        conflict = None
+    # Query-bound metadata may be incomplete, but known contradictions always
+    # win over provider trust flags, scores, and exact lookup provenance.
+    if target_isrcs and candidate_isrcs and not common_isrcs:
+        eligible, reason = False, "isrc_conflict"
+    elif conflict:
+        eligible, reason = False, conflict
+    elif target_duration is not None and candidate_duration is not None and abs(target_duration - candidate_duration) > tolerance:
+        eligible, reason = False, "duration_conflict"
+    elif not verified:
         # Boidu's public cache endpoint is keyed by the exact title/artist/
         # duration query but often returns only TTML, without metadata. Treat
         # that narrow provider contract as evidence, not as a generic bypass.
         query_bound = bool(candidate.get("query_bound"))
-        provider_confidence = candidate.get("provider_confidence")
         if (
             query_bound
             and candidate.get("provider_id") == "boidu"
-            and _strong_text(target.get("title"), candidate.get("title"))
-            and _strong_text(target.get("artist"), candidate.get("artist"))
+            and _strong_text(title, other_title)
+            and _strong_text(artist, other_artist)
         ):
             eligible, reason = True, "provider_query_bound"
         elif (
             candidate.get("exact_lookup")
             and candidate.get("provider_id") == "lrclib"
-            and _strong_text(target.get("title"), candidate.get("title"))
-            and _strong_text(target.get("artist"), candidate.get("artist"))
+            and _strong_text(title, other_title)
+            and _strong_text(artist, other_artist)
         ):
             eligible, reason = True, "provider_exact_lookup"
-        elif isinstance(provider_confidence, (int, float)) and provider_confidence >= 0.80:
-            eligible, reason = True, "provider_confidence"
         else:
             eligible, reason = False, "metadata_unverified"
-    elif target_isrcs and candidate_isrcs and not common_isrcs:
-        eligible, reason = False, "isrc_conflict"
     else:
-        conflict = _gross_metadata_conflict(target, candidate)
-        # An exact ISRC identifies the recording more reliably than an
-        # optional release/version suffix.  Picard often has a bare title
-        # while LRC.red/Apple returns "(Remastered 2011)".  Keep rejecting
-        # artist/title contradictions, but do not reject that benign version
-        # annotation when the ISRC agrees.
-        if exact_isrc and conflict == "version_conflict":
-            conflict = None
-        if conflict:
-            eligible, reason = False, conflict
-        elif target_duration is not None and candidate_duration is not None and abs(target_duration - candidate_duration) > tolerance:
-            eligible, reason = False, "duration_conflict"
-        elif exact_isrc:
+        if exact_isrc:
             eligible, reason = True, "exact_isrc"
-        elif not _strong_text(target.get("title"), candidate.get("title")):
+        elif not _strong_text(title, other_title):
             eligible, reason = False, "title_insufficient"
-        elif not _strong_text(target.get("artist"), candidate.get("artist")):
+        elif not _strong_text(artist, other_artist):
             eligible, reason = False, "artist_insufficient"
         elif target_duration is None or candidate_duration is None:
             if not (target.get("album") and candidate.get("album") and album_score >= 0.90):
@@ -333,20 +371,50 @@ def same_recording(a: dict, b: dict, tolerance: float = 5) -> bool:
         return _gross_metadata_conflict(a, b) is None
     # Eligibility permits small provider typos.  Grouping is stricter: fuzzy
     # title matches must not silently group adjacent songs on the same album.
-    return (
-        bool(normalize_text(a.get("title")))
-        and bool(normalize_text(a.get("artist")))
-        and normalize_text(a.get("title")) == normalize_text(b.get("title"))
-        and normalize_text(a.get("artist")) == normalize_text(b.get("artist"))
-    )
+    text = _recording_text(a)
+    return bool(text[0] and text[1] and text == _recording_text(b))
+
+
+def _metadata_tie_choice(target: dict, contenders: list[dict], tolerance: float) -> dict | None:
+    """Choose one release identity, without claiming distinct ISRCs equivalent."""
+
+    if normalize_isrcs(target.get("isrc")):
+        return None
+    text = _recording_text(target)
+    album = normalize_text(target.get("album"))
+    duration = parse_duration(target.get("duration"))
+    if not text[0] or not text[1] or not album or duration is None:
+        return None
+    durations = [duration]
+    for item in contenders:
+        other_duration = parse_duration(item.get("duration"))
+        if (
+            not _verified(item.get("metadata_verified", True))
+            or _recording_text(item) != text
+            or normalize_text(item.get("album")) != album
+            or other_duration is None
+            or not _versions_compatible(target, item)
+        ):
+            return None
+        durations.append(other_duration)
+    if max(durations) - min(durations) > max(0.0, float(tolerance)):
+        return None
+    # Scores prefer the closest duration; lexical identity breaks exact ties
+    # reproducibly even when provider response order changes.
+    best = min(contenders, key=lambda item: (
+        -item["score"], item["identity"], str(item.get("provider_id") or ""),
+        str(item.get("id") or ""), str(item.get("url") or ""),
+    ))
+    return dict(best, match_reason="exact_metadata_tie_break")
 
 
 def choose_identity_group(target: dict, candidates: Iterable[dict], tolerance: float = 5, margin: float = 0.03) -> list[dict]:
-    """Return the best verified group, or [] on a close distinct-identity tie.
+    """Return one identity group, or [] on an unresolved identity tie.
 
     Unlike fuzzy eligibility, group membership requires same_recording.  This
     also keeps candidates of unknown duration separate: there is no duration
-    evidence to prove they can safely be used for quality-based fallback.
+    evidence to prove they can safely be used for quality-based fallback. A
+    narrowly exact metadata tie may select ONE candidate, never a merged group.
     """
 
     ranked = rank_candidates(target, candidates, tolerance)
@@ -354,28 +422,37 @@ def choose_identity_group(target: dict, candidates: Iterable[dict], tolerance: f
     if not eligible:
         return []
     best = eligible[0]
-    for other in eligible[1:]:
-        if best["score"] - other["score"] > max(0.0, float(margin)):
-            break
-        if not same_recording(best, other, tolerance):
-            return []
-    return [item for item in eligible if same_recording(best, item, tolerance)] or [best]
+    contenders = [item for item in eligible if best["score"] - item["score"] <= max(0.0, float(margin))]
+    # Pairwise checks prevent a metadata-only or multi-ISRC candidate from
+    # bridging two records whose explicit ISRCs contradict each other.
+    if any(
+        not same_recording(item, other, tolerance)
+        for index, item in enumerate(contenders)
+        for other in contenders[index + 1:]
+    ):
+        choice = _metadata_tie_choice(target, contenders, tolerance)
+        return [choice] if choice is not None else []
+    group = [best]
+    for item in eligible[1:]:
+        if all(same_recording(member, item, tolerance) for member in group):
+            group.append(item)
+    return group
 
 
 def ambiguity(target: dict, candidates: Iterable[dict], tolerance: float = 5, margin: float = 0.03) -> bool:
-    """Return true when close-scoring eligible candidates are distinct recordings."""
+    """Report distinct identities, even if exact metadata permits choosing one."""
 
     ranked = rank_candidates(target, candidates, tolerance)
     eligible = [item for item in ranked if item.get("match_eligible")]
     if len(eligible) < 2:
         return False
     best = eligible[0]
-    for other in eligible[1:]:
-        if best["score"] - other["score"] > max(0.0, float(margin)):
-            break
-        if not same_recording(best, other, tolerance):
-            return True
-    return False
+    contenders = [item for item in eligible if best["score"] - item["score"] <= max(0.0, float(margin))]
+    return any(
+        not same_recording(item, other, tolerance)
+        for index, item in enumerate(contenders)
+        for other in contenders[index + 1:]
+    )
 
 
 __all__ = [

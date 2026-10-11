@@ -23,6 +23,7 @@ import time
 from urllib.parse import quote, urlencode
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+from weakref import WeakKeyDictionary
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
 
@@ -124,8 +125,9 @@ SELECT_ROWS = QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
 SINGLE_SELECTION = QtWidgets.QAbstractItemView.SelectionMode.SingleSelection
 NO_EDIT_TRIGGERS = QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
 
-# Set to track files currently being saved to avoid re-triggering hooks
-files_processing: set = set()
+# Object identity survives Picard's file renames. Keep the guard until the
+# asynchronous plugin save reaches its post-save hook, not merely save()'s return.
+files_processing = WeakKeyDictionary()
 
 # Common audio extensions for orphaned file scanning
 AUDIO_EXTENSIONS = {
@@ -1343,10 +1345,14 @@ def query_all_sources(
         pref = "all"
 
     if pref in ("all", "lrcred"):
-        results.extend(search_lrcred(title, artist, album, isrc, query))
+        found = search_lrcred(title, artist, album, isrc, query)
+        results.extend(found)
+        log.info(f"{PLUGIN_NAME}: provider lrcred returned {len(found)} candidate(s)")
 
     if pref in ("all", "unison"):
-        results.extend(search_unison(title, artist, album, duration, query))
+        found = search_unison(title, artist, album, duration, query)
+        results.extend(found)
+        log.info(f"{PLUGIN_NAME}: provider unison returned {len(found)} candidate(s)")
 
     target = {
         "title": title,
@@ -1361,11 +1367,13 @@ def query_all_sources(
         "boidu": bool(config["betterlyrics_enable_boidu"]),
         "lrclib": bool(config["betterlyrics_enable_lrclib"]),
     }
-    requested = [pref] if pref in optional else list(optional)
+    requested = list(optional) if pref == "all" else ([pref] if pref in optional else [])
     for provider_id in requested:
         if not optional[provider_id] and pref == "all":
+            log.info(f"{PLUGIN_NAME}: provider {provider_id} skipped: disabled")
             continue
         if _PROVIDER_HTTP is None:
+            log.info(f"{PLUGIN_NAME}: provider {provider_id} skipped: client unavailable")
             continue
         result = search_provider(
             provider_id,
@@ -1373,10 +1381,14 @@ def query_all_sources(
             _provider_request_json,
             api_key=config["betterlyrics_api_key"] if provider_id == "boidu" else "",
         )
-        if result.get("status") == "hit":
-            results.extend(result.get("candidates", []))
-        elif result.get("status") not in ("not_found", "auth_required"):
-            log.debug(f"{PLUGIN_NAME}: {provider_id} provider: {result.get('message', '')}")
+        status = result.get("status")
+        found = result.get("candidates", []) if status == "hit" else []
+        results.extend(found)
+        # Provider messages may contain response bodies or credential-bearing
+        # URLs. Log bounded status codes and counts instead.
+        if status not in ("hit", "not_found", "auth_required", "error", "rate_limited", "unavailable"):
+            status = "failed"
+        log.info(f"{PLUGIN_NAME}: provider {provider_id}: {status}; {len(found)} candidate(s)")
 
     for item in results:
         item["score"] = calculate_match_score(
@@ -1504,13 +1516,54 @@ def confirm_replace(parent, title: str, description: str) -> bool:
         return False
 
 
+def _enabled_lyric_tags():
+    return [
+        tag for tag, option in (
+            ("lyrics", "betterlyrics_embed_lyrics"),
+            ("ttml", "betterlyrics_embed_ttml_tag"),
+            ("syncedlyrics", "betterlyrics_embed_syncedlyrics"),
+        ) if config[option]
+    ]
+
+
+def _enabled_sidecars(file):
+    filename = getattr(file, "filename", None)
+    if not filename:
+        return []
+    stem = os.path.splitext(filename)[0]
+    return [
+        (extension, stem + "." + extension)
+        for extension in ("ttml", "lrc")
+        if config[f"betterlyrics_save_{extension}_file"]
+    ]
+
+
+def _has_writable_lyrics_destination(files, track):
+    """Avoid a lookup when all enabled destinations are already protected."""
+    overwrite = bool(config["betterlyrics_auto_overwrite"])
+    tags = _enabled_lyric_tags()
+    for target in files or ([track] if track is not None else []):
+        metadata = getattr(target, "metadata", {})
+        if any(overwrite or not metadata.get(tag) for tag in tags):
+            return True
+    return any(
+        overwrite or not os.path.exists(path)
+        for file in files or [] for _, path in _enabled_sidecars(file)
+    )
+
+
 def save_lyrics_to_files(
     file_list: list[File],
     bundle: dict,
     track: Track | None = None,
     interactive: bool = False,
+    changed_files: list | None = None,
 ) -> bool:
-    """Saves lyrics to the given Picard File objects and sidecar files."""
+    """Fill enabled destinations, protecting each existing destination separately.
+
+    Return whether anything changed; optionally collect only files whose
+    embedded metadata changed, so sidecar writes never trigger audio saves.
+    """
     if not bundle:
         return False
 
@@ -1526,100 +1579,83 @@ def save_lyrics_to_files(
     if not primary_tag_content:
         return False
 
-    def apply_metadata(target) -> bool:
-        """Embeds the selected lyrics in a Picard metadata object."""
+    values = {"lyrics": primary_tag_content, "ttml": ttml_content,
+              "syncedlyrics": lrc_content or ttml_content}
+    tags = {tag: values[tag] for tag in _enabled_lyric_tags() if values[tag]}
+    counts = {"tags": 0, "sidecars": 0, "protected": 0, "unchanged": 0}
+
+    def same_value(metadata, tag, value):
+        getall = getattr(metadata, "getall", None)
+        return getall(tag) == [value] if callable(getall) else metadata.get(tag) == value
+
+    def apply_target(target, sidecars=()):
+        metadata = target.metadata
+        overwrite = bool(config["betterlyrics_auto_overwrite"])
+        existing = any(metadata.get(tag) and not same_value(metadata, tag, value)
+                       for tag, value in tags.items())
+        existing = existing or any(os.path.exists(path) for _, path in sidecars)
+        if interactive and existing and not overwrite:
+            window = getattr(getattr(target, "tagger", None), "window", None)
+            overwrite = confirm_replace(
+                window, "Overwrite existing lyrics?",
+                f"Lyrics already exist for \"{metadata.get('title', '')}\".\n\n"
+                f"Preview of new lyrics:\n{truncate_text(primary_tag_content, 5, 45)}\n\n"
+                "Do you want to overwrite? Missing destinations will still be filled.",
+            )
         changed = False
-        if config["betterlyrics_embed_lyrics"]:
-            target.metadata["lyrics"] = primary_tag_content
-            changed = True
-        if config["betterlyrics_embed_ttml_tag"] and ttml_content:
-            target.metadata["ttml"] = ttml_content
-            changed = True
-        if config["betterlyrics_embed_syncedlyrics"]:
-            target.metadata["syncedlyrics"] = lrc_content or ttml_content
-            changed = True
+        for tag, value in tags.items():
+            if same_value(metadata, tag, value):
+                counts["unchanged"] += 1
+            elif metadata.get(tag) and not overwrite:
+                counts["protected"] += 1
+            else:
+                metadata[tag] = value
+                counts["tags"] += 1
+                changed = True
+        if changed and hasattr(target, "update"):
+            target.update()
+        for extension, path in sidecars:
+            content = bundle.get(extension)
+            if not content:
+                continue
+            exists = os.path.exists(path)
+            if exists and not overwrite:
+                counts["protected"] += 1
+                continue
+            try:
+                if exists:
+                    with open(path, "rb") as handle:
+                        if handle.read() == content.encode("utf-8"):
+                            counts["unchanged"] += 1
+                            continue
+                # Exclusive creation also protects a sidecar created while the
+                # lookup was in flight, without copying it into metadata.
+                with open(path, "w" if overwrite else "x", encoding="utf-8") as handle:
+                    handle.write(content)
+                counts["sidecars"] += 1
+                log.info(f"{PLUGIN_NAME}: Saved {extension.upper()} file to {path}")
+            except FileExistsError:
+                counts["protected"] += 1
+            except Exception as err:
+                log.error(f"{PLUGIN_NAME}: Failed to write {extension.upper()} file {path}: {err}")
         return changed
 
-    if not file_list:
-        if track and hasattr(track, "metadata") and apply_metadata(track):
-            if hasattr(track, "update"):
-                track.update()
-            return True
-        return False
-
-    saved_any = False
-    track_metadata_saved = False
+    embedded = False
     for file in file_list:
-        full_path = getattr(file, "filename", None)
-        if not full_path:
-            continue
+        if apply_target(file, _enabled_sidecars(file)):
+            embedded = True
+            if changed_files is not None:
+                changed_files.append(file)
+    if track is not None and hasattr(track, "metadata") and (embedded or not file_list):
+        apply_target(track)
 
-        dirname = os.path.dirname(full_path)
-        base_name = os.path.splitext(os.path.basename(full_path))[0]
-
-        ttml_sidecar = os.path.join(dirname, base_name + ".ttml")
-        lrc_sidecar = os.path.join(dirname, base_name + ".lrc")
-
-        has_tag_lyrics = bool(file.metadata.get("lyrics")) or bool(file.metadata.get("ttml"))
-        has_sidecar = os.path.exists(ttml_sidecar) or os.path.exists(lrc_sidecar)
-
-        if (
-            (has_tag_lyrics or has_sidecar)
-            and not config["betterlyrics_auto_overwrite"]
-            and interactive
-        ):
-            title = "Overwrite existing lyrics?"
-            preview_snippet = truncate_text(primary_tag_content, 5, 45)
-            desc = (
-                f"Lyrics already exist for \"{file.metadata.get('title', base_name)}\".\n\n"
-                f"Preview of new lyrics:\n{preview_snippet}\n\n"
-                "Do you want to overwrite?"
-            )
-            parent = getattr(file, "tagger", None)
-            parent_window = getattr(parent, "window", None) if parent else None
-            if not confirm_replace(parent_window, title, desc):
-                continue
-        elif has_tag_lyrics or has_sidecar:
-            # Automatic saves must never replace existing lyrics unless the
-            # explicit auto-overwrite option is enabled.
-            continue
-
-        # 1. Embed Metadata Tags
-        if apply_metadata(file):
-            # Crucial for Picard: Notify that file has pending metadata changes
-            if hasattr(file, "update"):
-                file.update()
-            saved_any = True
-
-            if track and hasattr(track, "metadata") and not track_metadata_saved:
-                if apply_metadata(track):
-                    if hasattr(track, "update"):
-                        track.update()
-                    track_metadata_saved = True
-
-        # 2. Save Sidecar Files (.ttml / .lrc)
-        save_ttml = config["betterlyrics_save_ttml_file"] or pref_format in ("ttml", "both")
-        save_lrc = config["betterlyrics_save_lrc_file"] or pref_format in ("lrc", "both")
-
-        if save_ttml and ttml_content:
-            try:
-                with open(ttml_sidecar, "w", encoding="utf-8") as f:
-                    f.write(ttml_content)
-                log.info(f"{PLUGIN_NAME}: Saved TTML file to {ttml_sidecar}")
-                saved_any = True
-            except Exception as err:
-                log.error(f"{PLUGIN_NAME}: Failed to write TTML file {ttml_sidecar}: {err}")
-
-        if save_lrc and lrc_content:
-            try:
-                with open(lrc_sidecar, "w", encoding="utf-8") as f:
-                    f.write(lrc_content)
-                log.info(f"{PLUGIN_NAME}: Saved LRC file to {lrc_sidecar}")
-                saved_any = True
-            except Exception as err:
-                log.error(f"{PLUGIN_NAME}: Failed to write LRC file {lrc_sidecar}: {err}")
-
-    return saved_any
+    changed = bool(counts["tags"] or counts["sidecars"])
+    log.info(
+        f"{PLUGIN_NAME}: Lyrics apply {'staged' if changed else 'no-op'}: "
+        f"{counts['tags']} tag(s) changed, {counts['sidecars']} sidecar(s) written, "
+        f"{counts['protected']} destination(s) protected, {counts['unchanged']} unchanged"
+    )
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1854,6 +1890,8 @@ def _extract_track_query(metadata, track) -> tuple[str, str, str, str, int]:
 
 def _dedup_key(track, files, method):
     """Builds a key so identical in-flight jobs are not queued twice."""
+    if method == "save" and files:
+        return (method, "files", tuple(sorted(id(file) for file in files)))
     if track is not None:
         return (method, "track", id(track))
     if files:
@@ -1893,6 +1931,7 @@ def _find_best_bundle(
             log.debug(f"{PLUGIN_NAME}: lyrics cache read failed: {e}")
             cached = None
         if cached:
+            log.info(f"{PLUGIN_NAME}: Automatic lookup: cached lyrics bundle available")
             return cached
 
     try:
@@ -1907,39 +1946,61 @@ def _find_best_bundle(
             prefer_synced=prefer_synced,
         )
     except Exception as e:
-        log.warning(f"{PLUGIN_NAME}: search failed for \"{title}\": {e}")
+        log.warning(f"{PLUGIN_NAME}: search failed for \"{title}\": {type(e).__name__}")
         return None
 
     if not candidates:
+        log.info(f"{PLUGIN_NAME}: Automatic lookup: providers returned no candidates")
         return None
 
+    eligible = 0
+    for index, candidate in enumerate(candidates, 1):
+        assessment = assess_match(target, candidate, tolerance)
+        accepted = candidate.get("match_eligible", assessment["eligible"])
+        reason = candidate.get("match_reason", assessment["reason"])
+        eligible += bool(accepted)
+        provider = candidate.get("provider_id")
+        if provider not in ("lrcred", "unison", "lyricsplus", "boidu", "lrclib"):
+            provider = "legacy/unknown"
+        log.info(
+            f"{PLUGIN_NAME}: Candidate {index} ({provider}) for \"{title}\" decision: "
+            f"{'eligible' if accepted else 'rejected'}; reason={reason}"
+        )
+    log.info(f"{PLUGIN_NAME}: Automatic lookup: {len(candidates)} candidate(s), {eligible} eligible")
     identity_group = choose_identity_group(candidates= candidates, target=target, tolerance=tolerance)
     if not identity_group:
         log.warning(f"{PLUGIN_NAME}: ambiguous or unverified lyrics matches for \"{title}\"")
         return None
+    log.info(
+        f"{PLUGIN_NAME}: Selected identity group for \"{title}\": "
+        f"{len(identity_group)} candidate(s); reason={identity_group[0].get('match_reason')}"
+    )
 
     # A high-scoring result is not useful if its lyrics endpoint is empty or
     # unavailable.  Try the next compatible candidate instead of failing the
     # whole track on the first provider result.
     for candidate in identity_group:
         if not _candidate_is_compatible(title, artist, length, isrc, candidate, tolerance):
+            log.info(f"{PLUGIN_NAME}: Candidate skipped: incompatible recording")
             continue
         try:
             bundle = resolve_lyrics_bundle(candidate, clean_words=clean_words)
         except Exception as e:
             log.warning(
                 f"{PLUGIN_NAME}: failed to resolve lyrics candidate "
-                f"\"{candidate.get('title')}\" for \"{title}\": {e}"
+                f"\"{candidate.get('title')}\" for \"{title}\": {type(e).__name__}"
             )
             continue
 
         if bundle.get("ttml") or bundle.get("lrc"):
+            log.info(f"{PLUGIN_NAME}: Candidate resolved: usable lyrics bundle")
             if cache_key:
                 try:
                     _LYRICS_STORE.put(cache_key, bundle)
                 except Exception as e:
                     log.debug(f"{PLUGIN_NAME}: lyrics cache write failed: {e}")
             return bundle
+        log.info(f"{PLUGIN_NAME}: Candidate skipped: empty lyrics bundle")
 
     log.warning(f"{PLUGIN_NAME}: no compatible lyrics candidate resolved for \"{title}\"")
     return None
@@ -1947,31 +2008,40 @@ def _find_best_bundle(
 
 def _apply_auto_bundle(method: str, title: str, files, track, bundle: dict | None) -> None:
     """Main-thread consumer: writes a resolved bundle into Picard's data model."""
-    if not bundle:
-        log.warning(f"{PLUGIN_NAME}: No lyrics found for \"{title}\"")
-        if method == "save":
-            for file in files or []:
-                files_processing.discard(getattr(file, "filename", None))
-        return
     try:
-        saved = save_lyrics_to_files(files, bundle, track=track, interactive=False)
-        if saved:
-            if method == "save":
-                # Match the upstream LRCLIB plugin: a save-triggered lookup
-                # must persist the newly embedded metadata to the audio file.
-                for file in files or []:
-                    save = getattr(file, "save", None)
-                    if callable(save):
-                        save()
-                log.info(f"{PLUGIN_NAME}: Successfully matched and saved TTML/LRC lyrics for \"{title}\"")
-            else:
-                log.info(f"{PLUGIN_NAME}: Successfully matched and staged TTML/LRC lyrics for \"{title}\"")
+        if not bundle:
+            log.info(f"{PLUGIN_NAME}: No usable lyrics found for \"{title}\"; nothing staged")
+            return
+        changed_files = []
+        changed = save_lyrics_to_files(
+            files, bundle, track=track, interactive=False, changed_files=changed_files
+        )
+        if method == "save":
+            for file in changed_files:
+                save = getattr(file, "save", None)
+                if not callable(save):
+                    continue
+                files_processing[file] = "saving"
+                try:
+                    if save() is False:
+                        files_processing.pop(file, None)
+                        log.info(f"{PLUGIN_NAME}: Audio save not submitted; lyrics remain staged")
+                    else:
+                        log.info(f"{PLUGIN_NAME}: Requested audio save for changed lyrics metadata")
+                except Exception as err:
+                    files_processing.pop(file, None)
+                    log.error(f"{PLUGIN_NAME}: Could not save changed lyrics metadata: {err}")
+        if changed:
+            log.info(f"{PLUGIN_NAME}: Matched and staged lyrics for \"{title}\"")
+        else:
+            log.info(f"{PLUGIN_NAME}: Matched lyrics for \"{title}\"; no-op (protected or unchanged destinations)")
     except Exception as e:
         log.error(f"{PLUGIN_NAME}: Failed to apply lyrics for \"{title}\": {e}", exc_info=True)
     finally:
         if method == "save":
             for file in files or []:
-                files_processing.discard(getattr(file, "filename", None))
+                if files_processing.get(file) != "saving":
+                    files_processing.pop(file, None)
 
 
 def fetch_and_apply_lyrics(
@@ -2028,6 +2098,12 @@ def fetch_and_apply_lyrics(
         return True
 
     # Automatic flow: enqueue on the background fetch queue (never blocks the UI).
+    if not _has_writable_lyrics_destination(files, track):
+        log.info(
+            f"{PLUGIN_NAME}: Skipped lyrics lookup for \"{title}\": "
+            "all enabled destinations are protected or no destinations are enabled"
+        )
+        return False
     _ensure_queue_ready()
     source_pref = config["betterlyrics_source"]
     clean_words = bool(config["betterlyrics_clean_word_timestamps"])
@@ -2092,28 +2168,38 @@ def on_file_saved(api, file=None) -> None:
     if file is None:  # called as (file,)
         api, file = None, api
 
-    if not config.get("betterlyrics_get_on_save", False):
+    state = files_processing.get(file)
+    if state is not None:
+        if state == "saving":
+            files_processing.pop(file, None)
+            log.info(f"{PLUGIN_NAME}: Plugin audio save completed; suppressing recursive lookup")
+        else:
+            log.debug(f"{PLUGIN_NAME}: Lyrics lookup already pending for saved file")
         return
-    if file.filename in files_processing:
-        files_processing.discard(file.filename)
+    if not config.get("betterlyrics_get_on_save", False):
         return
 
     try:
-        files_processing.add(file.filename)
-        parent = getattr(file, "parent", None)
+        files_processing[file] = "fetching"
+        parent = _parent_item(file)
         track = parent if isinstance(parent, Track) else None
         metadata = getattr(track, "metadata", None) or file.metadata
         submitted = fetch_and_apply_lyrics("save", track, [file], metadata, interactive=False)
         if not submitted:
-            files_processing.discard(file.filename)
+            files_processing.pop(file, None)
     except Exception as err:
         log.error(f"{PLUGIN_NAME}: Error in on_file_saved: {err}", exc_info=True)
-        files_processing.discard(file.filename)
+        files_processing.pop(file, None)
 
 
 # ---------------------------------------------------------------------------
 # Context Menu Actions Helper & Classes
 # ---------------------------------------------------------------------------
+def _parent_item(item):
+    parent = getattr(item, "parent_item", None)
+    return parent if parent is not None else getattr(item, "parent", None)
+
+
 def extract_items(objs):
     """Normalizes selection objects from Picard context menu into tracks and files."""
     tracks = set()
@@ -2125,14 +2211,14 @@ def extract_items(objs):
             for t in getattr(item, "tracks", []):
                 tracks.add(t)
         elif isinstance(item, File):
-            parent = getattr(item, "parent", None)
+            parent = _parent_item(item)
             if isinstance(parent, Track):
                 tracks.add(parent)
             else:
                 files.append(item)
         elif hasattr(item, "files"):
             for f in getattr(item, "files", []):
-                parent = getattr(f, "parent", None)
+                parent = _parent_item(f)
                 if isinstance(parent, Track):
                     tracks.add(parent)
                 else:
@@ -2152,7 +2238,7 @@ class BetterLyricsGetAction(BaseAction):
                 fetch_and_apply_lyrics("get", track, track_files, metadata, interactive=False)
 
         for file in files:
-            parent = getattr(file, "parent", None)
+            parent = _parent_item(file)
             track = parent if isinstance(parent, Track) else None
             fetch_and_apply_lyrics("get", track, [file], file.metadata, interactive=False)
 
@@ -2170,7 +2256,7 @@ class BetterLyricsSearchAction(BaseAction):
                 fetch_and_apply_lyrics("search", track, track_files, metadata, interactive=True)
         elif files:
             file = files[0]
-            parent = getattr(file, "parent", None)
+            parent = _parent_item(file)
             track = parent if isinstance(parent, Track) else None
             fetch_and_apply_lyrics("search", track, [file], file.metadata, interactive=True)
 
