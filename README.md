@@ -136,6 +136,36 @@ python3.11 -m py_compile __init__.py tests/test_matching.py tests/test_lrcred.py
 The regression suite stubs Picard/Qt and HTTP responses. It does not replace
 an installation and UI test inside Picard.
 
+### Picard 3.0 album-menu crash compatibility
+
+On the reproduced Python 3.14 / PyQt 6.11 / Qt 6.11 runtime, Picard's
+album **Other versions** menu can crash during destruction when Python collects
+a cycle containing its request-cancellation callback. This was reproduced with
+the installed Picard helper without loading Better Lyrics or accessing music.
+
+`lyrics_qt_compat.py` keeps the destruction handler alive independently of that
+cycle. At plugin enable it replaces only the item-view menu's reference to the
+recognized vulnerable helper, and only on the affected runtime family. It does
+not modify Picard's application bundle, global Qt signals, or garbage collection.
+Disable restores the original reference; already-open menus retain their guards
+until destruction. Startup logs report whether protection was installed.
+
+Real-Qt checks run separately from the stub suite (PyQt6 required):
+
+```bash
+QT_QPA_PLATFORM=offscreen python tests/qt_menu_smoke.py
+# Requires PyInstaller and a local frozen Picard executable:
+QT_QPA_PLATFORM=offscreen python tests/qt_menu_lifetime_smoke.py \
+  --picard-binary "/path/to/MusicBrainz Picard.app/Contents/MacOS/picard-run"
+```
+
+The lifetime check exercises 300 menu/request cycles, cleanup and disable while
+a menu is alive. The optional `--baseline` flag **deliberately crashes an isolated
+child process** using the original helper, then checks the protected path. It
+does not open the user's Picard session or write audio files. Verification used
+Python 3.14.7, PyQt 6.11.0 and Qt 6.11.2; a full application click-through remains
+a separate check.
+
 ### Orphaned File Cleaner
 Under **Options -> Plugins -> Better Lyrics**, click **Clean Orphaned .ttml / .lrc Files in Library...** and select your music root directory. The plugin will recursively delete any `.ttml` or `.lrc` sidecars that no longer correspond to an audio file.
 

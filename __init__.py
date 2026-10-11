@@ -46,12 +46,20 @@ try:
     from .lyrics_matching import assess_match, choose_identity_group, rank_candidates
     from .lyrics_model import make_bundle, parse_kpoe, parse_lrc, parse_ttml
     from .lyrics_providers import search_provider
+    from .lyrics_qt_compat import (
+        install_menu_lifetime_workaround,
+        uninstall_menu_lifetime_workaround,
+    )
 except ImportError:  # Picard loads a plugin directory as a top-level module.
     from lyrics_cache import LyricsStore, track_key
     from lyrics_http import HttpClient, create_ssl_context
     from lyrics_matching import assess_match, choose_identity_group, rank_candidates
     from lyrics_model import make_bundle, parse_kpoe, parse_lrc, parse_ttml
     from lyrics_providers import search_provider
+    from lyrics_qt_compat import (
+        install_menu_lifetime_workaround,
+        uninstall_menu_lifetime_workaround,
+    )
 
 # ---------------------------------------------------------------------------
 # Plugin Constants & Default Options
@@ -2567,6 +2575,16 @@ def enable(api: PluginApi) -> None:
     global CURRENT_PLUGIN_API, _MAIN_INVOKER, _PROVIDER_HTTP, _LYRICS_STORE
     CURRENT_PLUGIN_API = api
 
+    # Picard invokes enable on the GUI thread, before menus can use our actions.
+    try:
+        if not install_menu_lifetime_workaround(log=log):
+            log.warning(f"{PLUGIN_NAME}: Qt menu lifetime protection is not active")
+    except Exception as error:
+        log.warning(
+            f"{PLUGIN_NAME}: Qt menu lifetime protection is not active (%s)",
+            type(error).__name__,
+        )
+
     # Register options with their defaults
     for key, default in PLUGIN_OPTIONS.items():
         api.plugin_config.register_option(key, default)
@@ -2614,6 +2632,13 @@ def enable(api: PluginApi) -> None:
 def disable() -> None:
     """Cleanup hook called when the plugin is disabled in Picard 3.0+."""
     global CURRENT_PLUGIN_API, _MAIN_INVOKER, _PROVIDER_HTTP, _LYRICS_STORE
+    try:
+        uninstall_menu_lifetime_workaround()
+    except Exception as error:
+        log.warning(
+            f"{PLUGIN_NAME}: Qt menu lifetime workaround cleanup failed (%s)",
+            type(error).__name__,
+        )
     if _PROVIDER_HTTP is not None:
         _PROVIDER_HTTP.close()
         _PROVIDER_HTTP = None
