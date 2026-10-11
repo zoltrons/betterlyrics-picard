@@ -19,6 +19,7 @@ import ssl
 import threading
 import time
 from urllib.parse import quote, urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 import xml.etree.ElementTree as ET
 from difflib import SequenceMatcher
@@ -69,7 +70,8 @@ PLUGIN_OPTIONS = {
 }
 
 # Service URLs
-LRC_RED_API_URL = "https://lrc.red/api/v1"
+LRC_RED_BASE_URL = "https://lrc.red"
+LRC_RED_SEARCH_URL = f"{LRC_RED_BASE_URL}/search.json"
 UNISON_API_URL = "https://unison.betterlyrics.org/lyrics"
 UNISON_SEARCH_URL = "https://unison.betterlyrics.org/lyrics/search"
 BETTER_LYRICS_API_URL = "https://api.betterlyrics.org/getLyrics"
@@ -592,6 +594,14 @@ def _http_get_with_retry(req, timeout: int, retries: int = HTTP_RETRIES) -> str 
         _RATE_LIMITER.acquire()
         try:
             status, body = _http_get(req, timeout)
+        except HTTPError as e:
+            status = e.code
+            last_status = status
+            last_error = None
+            try:
+                e.close()
+            except Exception:
+                pass
         except Exception as e:
             last_error = e
             status = None
@@ -1113,52 +1123,105 @@ def search_lrcred(
     isrc: str = "",
     query: str = "",
 ) -> list[dict]:
-    """Searches the LRC.red API (Better Lyrics primary catalog)."""
+    """Uses the documented ISRC resource and the website's text-search API."""
     candidates = []
     seen_ids = set()
+    isrc_pattern = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
 
-    def add_res(res):
-        c_id = res.get("id") or res.get("isrc") or f"{res.get('track_name')}_{res.get('artist_name')}"
-        if c_id in seen_ids:
-            return
-        seen_ids.add(c_id)
-        candidates.append({
-            "id": res.get("id"),
-            "title": res.get("track_name", ""),
-            "artist": res.get("artist_name", ""),
-            "album": res.get("album_name", ""),
-            "duration": res.get("duration", 0),
-            "isrc": res.get("isrc", ""),
-            "timing_type": res.get("timing_type", "none"),
-            "lyrics_url": res.get("lyricsUrl", ""),
+    def valid_isrc(value):
+        normalized = _normalize_isrc(value)
+        return normalized if isrc_pattern.fullmatch(normalized) else ""
+
+    def safe_duration(value):
+        try:
+            seconds = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
+            return 0
+        return seconds
+
+    def map_result(res):
+        if not isinstance(res, dict):
+            return None
+        normalized_isrc = valid_isrc(res.get("isrc"))
+        if not normalized_isrc:
+            return None
+
+        files = res.get("files")
+        files = files if isinstance(files, dict) else {}
+        ttml_url = files.get("ttml") if isinstance(files.get("ttml"), str) else ""
+        lrc_url = files.get("lrc") if isinstance(files.get("lrc"), str) else ""
+        if not ttml_url:
+            ttml_url = f"{LRC_RED_BASE_URL}/s/{normalized_isrc}.ttml"
+        if not lrc_url:
+            lrc_url = f"{LRC_RED_BASE_URL}/s/{normalized_isrc}.lrc"
+
+        # Search hits omit sync information; absence does not mean plain text.
+        timing_type = res.get("sync") or res.get("timing_type") or "unknown"
+        if not isinstance(timing_type, str):
+            timing_type = "unknown"
+
+        return {
+            "id": normalized_isrc,
+            "title": res.get("title", "") if isinstance(res.get("title", ""), str) else "",
+            "artist": res.get("artist", "") if isinstance(res.get("artist", ""), str) else "",
+            "album": res.get("album", "") if isinstance(res.get("album", ""), str) else "",
+            "duration": safe_duration(res.get("duration", 0)),
+            "isrc": normalized_isrc,
+            "timing_type": timing_type,
+            "lyrics_url": ttml_url,
+            "ttml_url": ttml_url,
+            "lrc_url": lrc_url,
+            "files": {"ttml": ttml_url, "lrc": lrc_url},
             "source": "LRC.red",
             "format": "ttml",
             "raw": res,
-        })
+        }
 
-    # 1. Search by ISRC
-    if isrc:
-        data = fetch_json(LRC_RED_API_URL, {"isrc": isrc.strip()})
-        if data and isinstance(data, dict):
-            for res in data.get("results", []):
-                add_res(res)
+    def add_res(res):
+        candidate = map_result(res)
+        if candidate is None or candidate["isrc"] in seen_ids:
+            return
+        seen_ids.add(candidate["isrc"])
+        candidates.append(candidate)
+
+    # An explicit search is authoritative; it must not return a stale track ISRC.
+    search_q = query.strip() if isinstance(query, str) else ""
+
+    # 1. Resolve a validated ISRC through LRC.red's single-object resource.
+    normalized_isrc = valid_isrc(isrc) if not search_q else ""
+    if normalized_isrc:
+        data = fetch_json(f"{LRC_RED_BASE_URL}/s/{normalized_isrc}.json")
+        if isinstance(data, dict) and valid_isrc(data.get("isrc")) == normalized_isrc:
+            add_res(data)
         if candidates:
             return candidates
 
-    # 2. Search by Track + Artist
-    if title and artist:
-        data = fetch_json(LRC_RED_API_URL, {"track": title, "artist": artist})
-        if data and isinstance(data, dict):
-            for res in data.get("results", []):
-                add_res(res)
+    # 2. Text search, with bounded cursor pagination and defensive row handling.
+    search_q = search_q or f"{artist} {title}".strip()
+    next_cursor = None
+    seen_cursors = set()
+    for _ in range(3):
+        if not search_q:
+            break
+        params = {"q": search_q}
+        if next_cursor:
+            params["after"] = next_cursor
+        data = fetch_json(LRC_RED_SEARCH_URL, params)
+        if not isinstance(data, dict):
+            break
+        hits = data.get("hits")
+        if not isinstance(hits, list):
+            break
+        for res in hits:
+            add_res(res)
 
-    # 3. Search by Free-form Query
-    search_q = query or f"{artist} {title}".strip()
-    if search_q:
-        data = fetch_json(LRC_RED_API_URL, {"q": search_q})
-        if data and isinstance(data, dict):
-            for res in data.get("results", []):
-                add_res(res)
+        cursor = data.get("next")
+        if not isinstance(cursor, str) or not cursor or cursor in seen_cursors:
+            break
+        seen_cursors.add(cursor)
+        next_cursor = cursor
 
     return candidates
 
@@ -1270,15 +1333,38 @@ def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> d
 
     # Handle LRC.red Source
     elif source == "LRC.red":
-        lyrics_url = candidate.get("lyrics_url", "")
-        if not lyrics_url and candidate.get("id"):
-            lyrics_url = f"https://lrc.red/s/{candidate['id']}.ttml"
+        urls = []
 
-        if lyrics_url:
+        def add_url(url):
+            if not isinstance(url, str):
+                return
+            url = url.strip()
+            if url and url not in urls:
+                urls.append(url)
+
+        # Prefer provider-supplied URLs independently; they need not be derived
+        # from one another (for example, a custom TTML URL and a custom LRC URL).
+        raw_candidate = candidate.get("raw")
+        raw_files = raw_candidate.get("files") if isinstance(raw_candidate, dict) else None
+        for files in (candidate.get("files"), raw_files):
+            if isinstance(files, dict):
+                add_url(files.get("ttml"))
+                add_url(files.get("lrc"))
+        add_url(candidate.get("ttml_url"))
+        add_url(candidate.get("lrc_url"))
+        add_url(candidate.get("lyrics_url"))
+
+        isrc_value = _normalize_isrc(candidate.get("isrc"))
+        if not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", isrc_value):
+            isrc_value = _normalize_isrc(candidate.get("id"))
+        if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", isrc_value):
+            add_url(f"{LRC_RED_BASE_URL}/s/{isrc_value}.ttml")
+            add_url(f"{LRC_RED_BASE_URL}/s/{isrc_value}.lrc")
+
+        for lyrics_url in urls:
             raw_content = fetch_text(lyrics_url)
-            if not raw_content and lyrics_url.endswith(".ttml"):
-                lrc_url = re.sub(r"\.ttml$", ".lrc", lyrics_url)
-                raw_content = fetch_text(lrc_url)
+            if raw_content:
+                break
 
     if not raw_content:
         return {"ttml": None, "lrc": None, "is_synced": False, "source": source}
@@ -1550,6 +1636,8 @@ def show_search_dialog(
             timing = item.get("timing_type", "none").lower()
             is_synced = timing in ("word", "line", "richsync", "linesync")
             sync_label = "TTML (Word)" if timing in ("word", "richsync") else ("TTML (Line)" if is_synced else "Plain")
+            if timing == "unknown":
+                sync_label = "Unknown (preview to check)"
 
             values = [
                 item.get("title") or "?",
@@ -1584,8 +1672,11 @@ def show_search_dialog(
         if not query_text:
             return
         current_results = query_all_sources(
-            title=query_text,
-            artist="",
+            title=title,
+            artist=artist,
+            album=album,
+            duration=duration,
+            isrc=isrc,
             query=query_text,
             source_preference=config["betterlyrics_source"],
         )

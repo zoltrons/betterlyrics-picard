@@ -88,6 +88,33 @@ Right-click any track or album in Picard's selection view:
 - **Plugins -> Get lyrics (TTML / LRC) automatically with Better Lyrics**: Executes the scoring and matching pipeline for the selected item(s).
 - **Plugins -> Search lyrics (TTML / LRC) manually with Better Lyrics**: Opens the search dialog. You can refine your search query, browse candidates, preview both TTML (XML) and LRC versions, and double-click or press OK to apply.
 
+### LRC.red lookup
+
+- Uses the [documented API](https://lrc.red/docs) resource `/s/{ISRC}.json`
+  for exact recording lookup, mapping `title`, `artist`, `album`, `duration`,
+  `sync`, and `files` from the response.
+- If the ISRC is absent or not found, searches by artist and title. An edited
+  manual query takes precedence over the original track's ISRC; the track's
+  metadata is still used to rank the returned candidates.
+- Text search uses the site's current `/search.json?q=...` endpoint and its
+  `hits` / `next` response (verified on 2026-10-11). This endpoint is used by
+  the website but is not described on `/docs`, so it may change independently.
+  Searches read at most three cursor pages and deduplicate by ISRC.
+- Downloads TTML first, then LRC if unavailable, using the returned `files`
+  URLs or the documented `/s/{ISRC}.ttml` and `/s/{ISRC}.lrc` resources.
+- Permanent HTTP failures such as 404 are not retried; transient network,
+  rate-limit and server failures retain the existing retry policy.
+
+### Developer checks
+
+```bash
+python3.11 -m unittest discover -s tests -v
+python3.11 -m py_compile __init__.py tests/test_matching.py tests/test_lrcred.py
+```
+
+The regression suite stubs Picard/Qt and HTTP responses. It does not replace
+an installation and UI test inside Picard.
+
 ### Orphaned File Cleaner
 Under **Options -> Plugins -> Better Lyrics**, click **Clean Orphaned .ttml / .lrc Files in Library...** and select your music root directory. The plugin will recursively delete any `.ttml` or `.lrc` sidecars that no longer correspond to an audio file.
 
