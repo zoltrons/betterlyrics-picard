@@ -67,7 +67,7 @@ class LrcRedTests(unittest.TestCase):
         self.assertEqual(fetch.call_args_list, [
             call(f"{BASE}/s/{ISRC}.ttml"), call(f"{BASE}/s/{ISRC}.lrc")
         ])
-        self.assertEqual(bundle["lrc"], "[00:01.00]test")
+        self.assertEqual(bundle["lrc"], "[00:01.000]test")
 
     def test_independent_files_urls_are_not_guessed_from_ttml(self):
         metadata = dict(METADATA, files={

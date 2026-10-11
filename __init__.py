@@ -37,6 +37,19 @@ from picard.plugin3.api import (
     Track,
 )
 
+try:
+    from .lyrics_cache import LyricsStore, track_key
+    from .lyrics_http import HttpClient, create_ssl_context
+    from .lyrics_matching import assess_match, choose_identity_group, rank_candidates
+    from .lyrics_model import make_bundle, parse_kpoe, parse_lrc, parse_ttml
+    from .lyrics_providers import search_provider
+except ImportError:  # Picard loads a plugin directory as a top-level module.
+    from lyrics_cache import LyricsStore, track_key
+    from lyrics_http import HttpClient, create_ssl_context
+    from lyrics_matching import assess_match, choose_identity_group, rank_candidates
+    from lyrics_model import make_bundle, parse_kpoe, parse_lrc, parse_ttml
+    from lyrics_providers import search_provider
+
 # ---------------------------------------------------------------------------
 # Plugin Constants & Default Options
 # ---------------------------------------------------------------------------
@@ -61,7 +74,10 @@ PLUGIN_OPTIONS = {
     "betterlyrics_ignore_instrumental": True,
     "betterlyrics_plain_as_txt": False,
     # Sources & Matching
-    "betterlyrics_source": "all",  # "all", "lrcred", "unison"
+    "betterlyrics_source": "all",  # all, lrcred, unison, lyricsplus, boidu, lrclib
+    "betterlyrics_enable_lyricsplus": False,
+    "betterlyrics_enable_boidu": False,
+    "betterlyrics_enable_lrclib": False,
     "betterlyrics_duration_tolerance": 5,  # seconds
     "betterlyrics_api_key": "",
     # Stability / anti-abuse tuning (background fetch queue)
@@ -459,6 +475,34 @@ FETCH_QUEUE = None
 # Main-thread dispatcher used by worker threads to apply results safely.
 _MAIN_INVOKER = None
 
+# Optional provider client and persistent bundle cache.  They are created only
+# after Picard enables the plugin, so importing the module stays side-effect free.
+_PROVIDER_HTTP = None
+_LYRICS_STORE = None
+
+
+def _lyrics_store_path() -> str:
+    """Return a user-data path, never a path inside the installed plugin."""
+    api = get_plugin_api()
+    app_data = None
+    try:
+        app_data = QtCore.QStandardPaths.writableLocation(
+            QtCore.QStandardPaths.StandardLocation.AppDataLocation
+        )
+    except Exception:
+        pass
+    if not app_data:
+        app_data = os.path.join(
+            os.path.expanduser("~"), "Library", "Application Support", "MusicBrainz", "Picard"
+        )
+    return os.path.join(app_data, "betterlyrics_cache.sqlite3")
+
+
+def _provider_request_json(url: str, params=None, headers=None):
+    if _PROVIDER_HTTP is None:
+        return None
+    return _PROVIDER_HTTP.request_json(url, params=params, headers=headers)
+
 
 class RateLimiter:
     """Thread-safe minimum-interval limiter that paces outbound requests.
@@ -556,7 +600,7 @@ def _init_caches() -> None:
 def _get_ssl_context():
     """Returns the verified default SSL context used for HTTPS requests."""
     try:
-        return ssl.create_default_context()
+        return create_ssl_context()
     except Exception as e:
         log.error(f"{PLUGIN_NAME}: Failed to create a verified SSL context: {e}", exc_info=True)
         raise
@@ -1082,6 +1126,8 @@ def _candidate_is_compatible(
     tolerance: int,
 ) -> bool:
     """Rejects identity conflicts before lyrics content is downloaded."""
+    if "match_eligible" in item and not item.get("match_eligible"):
+        return False
     item_isrc = item.get("isrc")
     exact_isrc = _has_exact_isrc(target_isrc, item_isrc)
     normalized_target_isrc = _normalize_isrc(target_isrc)
@@ -1176,6 +1222,8 @@ def search_lrcred(
             "files": {"ttml": ttml_url, "lrc": lrc_url},
             "source": "LRC.red",
             "format": "ttml",
+            "provider_id": "lrcred",
+            "metadata_verified": True,
             "raw": res,
         }
 
@@ -1256,6 +1304,8 @@ def search_unison(
                     "timing_type": res.get("syncType", "plain"),
                     "format": res.get("format", "ttml"),
                     "source": "Unison",
+                    "provider_id": "unison",
+                    "metadata_verified": True,
                     "direct_lyrics": res.get("lyrics"),
                     "raw": res,
                 })
@@ -1274,7 +1324,7 @@ def query_all_sources(
     duration_tolerance: int | None = None,
     prefer_synced: bool | None = None,
 ) -> list[dict]:
-    """Queries LRC.red, Unison, or both according to user preferences."""
+    """Queries configured providers and ranks candidates by recording identity."""
     results = []
 
     if duration_tolerance is None:
@@ -1283,7 +1333,7 @@ def query_all_sources(
         prefer_synced = bool(config["betterlyrics_prefer_synced"])
 
     pref = source_preference or "all"
-    if pref not in ("all", "lrcred", "unison"):
+    if pref not in ("all", "lrcred", "unison", "lyricsplus", "boidu", "lrclib"):
         pref = "all"
 
     if pref in ("all", "lrcred"):
@@ -1291,6 +1341,36 @@ def query_all_sources(
 
     if pref in ("all", "unison"):
         results.extend(search_unison(title, artist, album, duration, query))
+
+    target = {
+        "title": title,
+        "artist": artist,
+        "album": album,
+        "duration": duration,
+        "isrc": isrc,
+        "query": query,
+    }
+    optional = {
+        "lyricsplus": bool(config["betterlyrics_enable_lyricsplus"]),
+        "boidu": bool(config["betterlyrics_enable_boidu"]),
+        "lrclib": bool(config["betterlyrics_enable_lrclib"]),
+    }
+    requested = [pref] if pref in optional else list(optional)
+    for provider_id in requested:
+        if not optional[provider_id] and pref == "all":
+            continue
+        if _PROVIDER_HTTP is None:
+            continue
+        result = search_provider(
+            provider_id,
+            target,
+            _provider_request_json,
+            api_key=config["betterlyrics_api_key"] if provider_id == "boidu" else "",
+        )
+        if result.get("status") == "hit":
+            results.extend(result.get("candidates", []))
+        elif result.get("status") not in ("not_found", "auth_required"):
+            log.debug(f"{PLUGIN_NAME}: {provider_id} provider: {result.get('message', '')}")
 
     for item in results:
         item["score"] = calculate_match_score(
@@ -1303,14 +1383,23 @@ def query_all_sources(
             duration_tolerance=duration_tolerance,
         )
 
-    results.sort(
+    # The old providers predate the standalone matcher and may not carry an
+    # explicit verification flag. Their result metadata is still provider data;
+    # optional providers are stricter and set this flag themselves.
+    ranked = rank_candidates(
+        {"title": title, "artist": artist, "album": album, "duration": duration, "isrc": isrc},
+        results,
+        duration_tolerance,
+    )
+
+    ranked.sort(
         key=lambda x: (
             x.get("score", 0.0),
             1 if prefer_synced and x.get("timing_type") in SYNCED_TIMING_TYPES else 0,
         ),
         reverse=True,
     )
-    return results
+    return ranked
 
 
 def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> dict:
@@ -1321,6 +1410,17 @@ def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> d
     """
     source = candidate.get("source", "")
     raw_content = None
+
+    provider_id = candidate.get("provider_id") or candidate.get("source", "")
+    if provider_id == "lyricsplus" and isinstance(candidate.get("payload"), dict):
+        document = parse_kpoe(candidate["payload"])
+        bundle = make_bundle(document, clean_words=True if clean_words is None else clean_words)
+        bundle["source"] = source or "LyricsPlus"
+        bundle["provider_id"] = provider_id
+        return bundle
+
+    if provider_id in {"boidu", "lrclib"} and isinstance(candidate.get("direct_lyrics"), str):
+        raw_content = candidate["direct_lyrics"]
 
     # Handle Unison Source
     if source == "Unison":
@@ -1372,32 +1472,11 @@ def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> d
     if clean_words is None:
         clean_words = config["betterlyrics_clean_word_timestamps"]
 
-    if is_ttml_content(raw_content):
-        ttml_str = raw_content
-        lrc_str = ttml_to_lrc(ttml_str, word_synced=not clean_words)
-        if clean_words:
-            lrc_str = clean_word_timestamps(lrc_str)
-        is_synced = is_lrc_synced(lrc_str)
-        return {
-            "ttml": ttml_str,
-            "lrc": lrc_str,
-            "is_synced": is_synced,
-            "source": source,
-        }
-    else:
-        lrc_str = clean_word_timestamps(raw_content) if clean_words else raw_content
-        is_synced = is_lrc_synced(lrc_str)
-        ttml_str = lrc_to_ttml(
-            lrc_str,
-            title=candidate.get("title", ""),
-            artist=candidate.get("artist", "")
-        )
-        return {
-            "ttml": ttml_str,
-            "lrc": lrc_str,
-            "is_synced": is_synced,
-            "source": source,
-        }
+    document = parse_ttml(raw_content) if is_ttml_content(raw_content) else parse_lrc(raw_content)
+    bundle = make_bundle(document, clean_words=clean_words)
+    bundle["source"] = source
+    bundle["provider_id"] = provider_id
+    return bundle
 
 
 # ---------------------------------------------------------------------------
@@ -1793,6 +1872,23 @@ def _find_best_bundle(
     Pure network work only - never touches Qt/Picard objects, so it is safe to
     run off the GUI thread.
     """
+    target = {
+        "title": title,
+        "artist": artist,
+        "album": album_name,
+        "duration": length,
+        "isrc": isrc,
+    }
+    cache_key = track_key(target) if _LYRICS_STORE is not None else None
+    if cache_key:
+        try:
+            cached = _LYRICS_STORE.get(cache_key)
+        except Exception as e:
+            log.debug(f"{PLUGIN_NAME}: lyrics cache read failed: {e}")
+            cached = None
+        if cached:
+            return cached
+
     try:
         candidates = query_all_sources(
             title=title,
@@ -1811,10 +1907,15 @@ def _find_best_bundle(
     if not candidates:
         return None
 
+    identity_group = choose_identity_group(candidates= candidates, target=target, tolerance=tolerance)
+    if not identity_group:
+        log.warning(f"{PLUGIN_NAME}: ambiguous or unverified lyrics matches for \"{title}\"")
+        return None
+
     # A high-scoring result is not useful if its lyrics endpoint is empty or
     # unavailable.  Try the next compatible candidate instead of failing the
     # whole track on the first provider result.
-    for candidate in candidates:
+    for candidate in identity_group:
         if not _candidate_is_compatible(title, artist, length, isrc, candidate, tolerance):
             continue
         try:
@@ -1827,6 +1928,11 @@ def _find_best_bundle(
             continue
 
         if bundle.get("ttml") or bundle.get("lrc"):
+            if cache_key:
+                try:
+                    _LYRICS_STORE.put(cache_key, bundle)
+                except Exception as e:
+                    log.debug(f"{PLUGIN_NAME}: lyrics cache write failed: {e}")
             return bundle
 
     log.warning(f"{PLUGIN_NAME}: no compatible lyrics candidate resolved for \"{title}\"")
@@ -2182,9 +2288,25 @@ class BetterLyricsOptionsPage(OptionsPage):
         self.source_combo.addItem("All Sources (Smart Hybrid: LRC.red + Unison)", "all")
         self.source_combo.addItem("LRC.red (Better Lyrics Primary)", "lrcred")
         self.source_combo.addItem("Unison (Crowdsourced Community)", "unison")
+        self.source_combo.addItem("LyricsPlus (KPOE / Apple-compatible)", "lyricsplus")
+        self.source_combo.addItem("Better Lyrics API / Boidu", "boidu")
+        self.source_combo.addItem("LRCLIB (line-synced fallback)", "lrclib")
         src_h.addWidget(src_label)
         src_h.addWidget(self.source_combo)
         adv_layout.addLayout(src_h)
+
+        self.enable_lyricsplus = QtWidgets.QCheckBox(
+            "Enable LyricsPlus word / syllable-timed fallback", self
+        )
+        self.enable_boidu = QtWidgets.QCheckBox(
+            "Enable Better Lyrics API / Boidu fallback (may require your own API key)", self
+        )
+        self.enable_lrclib = QtWidgets.QCheckBox(
+            "Enable LRCLIB line-synced fallback", self
+        )
+        adv_layout.addWidget(self.enable_lyricsplus)
+        adv_layout.addWidget(self.enable_boidu)
+        adv_layout.addWidget(self.enable_lrclib)
 
         tol_h = QtWidgets.QHBoxLayout()
         tol_label = QtWidgets.QLabel("Duration tolerance (seconds):", self)
@@ -2275,6 +2397,10 @@ class BetterLyricsOptionsPage(OptionsPage):
         if idx >= 0:
             self.source_combo.setCurrentIndex(idx)
 
+        self.enable_lyricsplus.setChecked(bool(cfg.get("betterlyrics_enable_lyricsplus", False)))
+        self.enable_boidu.setChecked(bool(cfg.get("betterlyrics_enable_boidu", False)))
+        self.enable_lrclib.setChecked(bool(cfg.get("betterlyrics_enable_lrclib", False)))
+
         self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 5)))
         self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "")))
         self.workers_spin.setValue(int(cfg.get("betterlyrics_max_workers", 3)))
@@ -2305,6 +2431,9 @@ class BetterLyricsOptionsPage(OptionsPage):
 
         src_data = self.source_combo.currentData()
         cfg["betterlyrics_source"] = src_data or "all"
+        cfg["betterlyrics_enable_lyricsplus"] = self.enable_lyricsplus.isChecked()
+        cfg["betterlyrics_enable_boidu"] = self.enable_boidu.isChecked()
+        cfg["betterlyrics_enable_lrclib"] = self.enable_lrclib.isChecked()
         cfg["betterlyrics_duration_tolerance"] = self.duration_spin.value()
         cfg["betterlyrics_api_key"] = self.api_key_input.text().strip()
         cfg["betterlyrics_max_workers"] = self.workers_spin.value()
@@ -2325,7 +2454,7 @@ class BetterLyricsOptionsPage(OptionsPage):
 # ---------------------------------------------------------------------------
 def enable(api: PluginApi) -> None:
     """Entry point called when the plugin is enabled in MusicBrainz Picard 3.0+."""
-    global CURRENT_PLUGIN_API, _MAIN_INVOKER
+    global CURRENT_PLUGIN_API, _MAIN_INVOKER, _PROVIDER_HTTP, _LYRICS_STORE
     CURRENT_PLUGIN_API = api
 
     # Register options with their defaults
@@ -2335,6 +2464,17 @@ def enable(api: PluginApi) -> None:
     # Prepare the stability layer: caches, request pacer and background queue.
     _init_caches()
     _RATE_LIMITER.set_interval(_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0)
+    _PROVIDER_HTTP = HttpClient(
+        timeout=12.0,
+        retries=2,
+        min_interval=_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0,
+        ssl_context=_get_ssl_context(),
+    )
+    try:
+        _LYRICS_STORE = LyricsStore(_lyrics_store_path())
+    except Exception as e:
+        _LYRICS_STORE = None
+        log.warning(f"{PLUGIN_NAME}: persistent lyrics cache unavailable: {e}")
     FETCH_QUEUE.configure(_config_int(api, "betterlyrics_max_workers", 3))
     if _MAIN_INVOKER is not None:
         _MAIN_INVOKER.stop()
@@ -2363,7 +2503,16 @@ def enable(api: PluginApi) -> None:
 
 def disable() -> None:
     """Cleanup hook called when the plugin is disabled in Picard 3.0+."""
-    global CURRENT_PLUGIN_API, _MAIN_INVOKER
+    global CURRENT_PLUGIN_API, _MAIN_INVOKER, _PROVIDER_HTTP, _LYRICS_STORE
+    if _PROVIDER_HTTP is not None:
+        _PROVIDER_HTTP.close()
+        _PROVIDER_HTTP = None
+    if _LYRICS_STORE is not None:
+        try:
+            _LYRICS_STORE.close()
+        except Exception:
+            pass
+        _LYRICS_STORE = None
     if FETCH_QUEUE is not None:
         FETCH_QUEUE.stop()
     if _MAIN_INVOKER is not None:

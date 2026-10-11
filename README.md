@@ -8,16 +8,20 @@ Designed for **MusicBrainz Picard 3.0+** using the modern **Plugin v3** architec
 
 ## Features
 
-- **Native TTML Support**: Fetches and embeds Apple Music / Better Lyrics-compliant TTML XML directly into audio file metadata (`©lyr` for MP4/M4A, `USLT` for MP3, `LYRICS` and `ttml` tags for FLAC/Vorbis), preserving word-by-word timing, roles, and background vocals.
+- **Native TTML Support**: Fetches and embeds Apple Music / Better Lyrics-compliant TTML XML directly into audio file metadata (`©lyr` for MP4/M4A, `USLT` for MP3, `LYRICS` and `ttml` tags for FLAC/Vorbis), preserving word-by-word timing, roles, background vocals, translations and romanization when supplied.
 - **Sidecar File Export**: Saves `.ttml` and/or `.lrc` files directly alongside your audio tracks (`Track.ttml`, `Track.lrc`).
 - **LRC Conversion & Word-Sync Cleaning**: Converts TTML to LRC on the fly when needed. Strips inline word timestamps (`<mm:ss.xx>`) into standard line timestamps (`[mm:ss.xx]`) for broad player compatibility (Plex, Jellyfin, Foobar2000, VLC, mobile players).
-- **Dual Backend Providers**:
+- **Lyrics Providers**:
   - **LRC.red API**: Primary synced lyrics catalog used by Better Lyrics.
   - **Unison API**: Official crowdsourced community database of Better Lyrics.
-  - **Better Lyrics API**: Optional support for custom API keys.
+  - **LyricsPlus KPOE v2**: Optional Apple-compatible word / syllable-timed lyrics.
+  - **Better Lyrics API / Boidu**: Optional cache-aware TTML fallback.
+  - **LRCLIB**: Optional line-synced fallback.
 - **Smart Match Scoring**: Ranks results with explicit identity weights (ISRC 35%, title 30%, artist 15%, album 5%, duration 15%), strict duration tolerance (default ±5s), and exact MusicBrainz ISRC matching. Empty metadata never receives a false bonus, and a failed lyrics endpoint falls back to the next compatible candidate.
 - **Background Fetch Queue**: Non-blocking worker pool fetches lyrics off the UI thread, so loading large albums never freezes Picard. Identical in-flight jobs are de-duplicated, transient failures (HTTP 429/5xx, network errors) are retried with exponential backoff, and successful responses are cached to reduce repeat lookups.
 - **Rate Limiting / Anti-Abuse**: A configurable minimum delay between outbound requests paces the whole queue, preventing burst traffic and API rate-limit (`429`) responses.
+- **Loss-aware lyrics model**: Keeps native TTML, enhanced word-timed LRC, line LRC and plain text as separate representations; missing word end times are never fabricated.
+- **Persistent matching cache**: Stores successful bundles and manual provider choices in Picard's user-data directory, never inside the installed plugin or source repository.
 - **Interactive Search Dialog**: Right-click any track or album to search manually, view results in a detailed table (title, artist, album, duration, sync type, source), and inspect lyrics with side-by-side TTML/LRC preview before applying.
 - **Automation Hooks**: Automatic search and retrieval when loading tracks into Picard or when saving files.
 - **Library Maintenance**: Built-in tool to scan your music directory and clean up orphaned `.ttml` and `.lrc` files whose audio counterparts have been removed.
@@ -71,6 +75,9 @@ Settings are available under **Options -> Plugins -> Better Lyrics**:
 | **Search when saving files** | `Disabled` | Automatically queries for lyrics when saving files. |
 | **Auto overwrite existing lyrics** | `Disabled` | Overwrites existing tags and sidecars without prompting. |
 | **Primary Source** | `All Sources` | Select `All Sources (Smart Hybrid)`, `LRC.red`, or `Unison`. |
+| **LyricsPlus word/syllable fallback** | `Disabled` | Enables the KPOE v2 LyricsPlus adapter. Off by default because it uses a third-party public service. |
+| **Better Lyrics API / Boidu fallback** | `Disabled` | Enables the Better Lyrics API fallback. Add only your own authorized API key when uncached requests require one. |
+| **LRCLIB fallback** | `Disabled` | Enables the line-synced LRCLIB fallback. |
 | **Duration tolerance (seconds)** | `5` | Maximum allowable difference between audio track length and lyric duration. |
 | **Max parallel requests** | `3` | Number of background worker threads used to fetch lyrics concurrently (higher = faster, more bandwidth). |
 | **Minimum delay between requests (ms)** | `200` | Minimum spacing between outbound HTTP requests across all workers. Prevents API abuse and `429` rate-limiting (`0` disables pacing). |
