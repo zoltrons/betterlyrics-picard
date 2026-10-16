@@ -10,22 +10,15 @@
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from functools import partial
-import json
 import os
 import queue
-import random
 import re
-import ssl
+import shutil
+import tempfile
 import threading
 import time
-from urllib.parse import quote, urlencode
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
 from weakref import WeakKeyDictionary
-import xml.etree.ElementTree as ET
-from difflib import SequenceMatcher
 
 from PyQt6 import QtCore, QtGui, QtWidgets
 from PyQt6.QtCore import Qt
@@ -43,7 +36,12 @@ from picard.plugin3.api import (
 try:
     from .lyrics_cache import LyricsStore, track_key
     from .lyrics_http import HttpClient, create_ssl_context
-    from .lyrics_matching import assess_match, choose_identity_group, rank_candidates
+    from .lyrics_matching import (
+        assess_match,
+        choose_identity_group,
+        normalize_isrcs,
+        rank_candidates,
+    )
     from .lyrics_model import make_bundle, parse_kpoe, parse_lrc, parse_ttml
     from .lyrics_providers import search_provider
     from .lyrics_qt_compat import (
@@ -53,7 +51,12 @@ try:
 except ImportError:  # Picard loads a plugin directory as a top-level module.
     from lyrics_cache import LyricsStore, track_key
     from lyrics_http import HttpClient, create_ssl_context
-    from lyrics_matching import assess_match, choose_identity_group, rank_candidates
+    from lyrics_matching import (
+        assess_match,
+        choose_identity_group,
+        normalize_isrcs,
+        rank_candidates,
+    )
     from lyrics_model import make_bundle, parse_kpoe, parse_lrc, parse_ttml
     from lyrics_providers import search_provider
     from lyrics_qt_compat import (
@@ -101,26 +104,18 @@ LRC_RED_BASE_URL = "https://lrc.red"
 LRC_RED_SEARCH_URL = f"{LRC_RED_BASE_URL}/search.json"
 UNISON_API_URL = "https://unison.betterlyrics.org/lyrics"
 UNISON_SEARCH_URL = "https://unison.betterlyrics.org/lyrics/search"
-BETTER_LYRICS_API_URL = "https://api.betterlyrics.org/getLyrics"
 
-# Matching weights deliberately sum to 1.0.  ISRC is the strongest identity
-# signal, while title/artist remain the primary fallback when an API result has
-# no ISRC.  Duration is useful for disambiguation, but must not overpower an
-# otherwise exact title/artist match.
-MATCH_WEIGHTS = {
-    "isrc": 0.35,
-    "title": 0.30,
-    "artist": 0.15,
-    "album": 0.05,
-    "duration": 0.15,
-}
-MATCH_MIN_SCORE_WITHOUT_ISRC = 0.40
-SYNCED_TIMING_TYPES = frozenset(("word", "line", "richsync", "linesync"))
+PROVIDER_IDS = ("lrcred", "unison", "lyricsplus", "boidu", "lrclib")
+OPTIONAL_PROVIDER_IDS = ("lyricsplus", "boidu", "lrclib")
+# LRC.red search hits omit their sync type; they are usually timed, so an
+# unknown type is tried before a provider that explicitly reports plain text.
+_TIMING_RANK = {"word": 0, "richsync": 0, "syllable": 0, "line": 1, "linesync": 1, "unknown": 2}
+_PLAIN_TIMING_RANK = 3
 
-DEFAULT_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/131.0.0.0 Safari/537.36 MusicBrainzPicard-BetterLyrics/1.2"
-)
+ISRC_PATTERN = re.compile(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}")
+USER_AGENT = "betterlyrics-picard/1.3.0 (+https://github.com/zoltrons/betterlyrics-picard)"
+# Manual choices outlive ordinary cache entries; lyrics_cache caps TTLs at a year.
+MANUAL_CHOICE_TTL = 365 * 24 * 60 * 60.0
 
 # PyQt6 Layout & View Alignment Constants
 ALIGN_CENTER = Qt.AlignmentFlag.AlignCenter
@@ -137,6 +132,9 @@ NO_EDIT_TRIGGERS = QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers
 # asynchronous plugin save reaches its post-save hook, not merely save()'s return.
 files_processing = WeakKeyDictionary()
 
+# Sidecars written per file, so they can follow the audio when Picard renames it.
+_WRITTEN_SIDECARS = WeakKeyDictionary()
+
 # Common audio extensions for orphaned file scanning
 AUDIO_EXTENSIONS = {
     ".aac", ".ac3", ".aif", ".aifc", ".aiff", ".ape", ".asf", ".dff",
@@ -151,7 +149,6 @@ CURRENT_PLUGIN_API: PluginApi | None = None
 
 def get_plugin_api() -> PluginApi | None:
     """Retrieves the active PluginApi instance."""
-    global CURRENT_PLUGIN_API
     if CURRENT_PLUGIN_API is not None:
         return CURRENT_PLUGIN_API
     try:
@@ -191,7 +188,16 @@ log = LoggerProxy()
 
 
 class ConfigProxy:
-    """Routes configuration lookups and updates to api.plugin_config."""
+    """Routes configuration lookups and updates to api.plugin_config.
+
+    Picard's config section is not safe to read from worker threads, so
+    background jobs receive a snapshot taken on the GUI thread instead.
+    """
+
+    def __init__(self):
+        # Used only when no PluginApi is available (tests, discovery); writes
+        # must never alter PLUGIN_OPTIONS, which holds the registered defaults.
+        self._local: dict = {}
 
     def get(self, key: str, default=None):
         api = get_plugin_api()
@@ -204,6 +210,8 @@ class ConfigProxy:
                     return value
             except Exception:
                 pass
+        if key in self._local:
+            return self._local[key]
         fallback = PLUGIN_OPTIONS.get(key)
         if fallback is not None:
             return fallback
@@ -217,9 +225,10 @@ class ConfigProxy:
         if api and hasattr(api, "plugin_config"):
             try:
                 api.plugin_config[key] = value
+                return
             except Exception:
                 pass
-        PLUGIN_OPTIONS[key] = value
+        self._local[key] = value
 
 
 config = ConfigProxy()
@@ -261,9 +270,10 @@ def _ensure_queue_ready() -> None:
 # ---------------------------------------------------------------------------
 def format_duration(seconds: int | float | None) -> str:
     """Formats duration in seconds to mm:ss or hh:mm:ss."""
-    if seconds is None:
-        return "0:00"
-    total_sec = max(0, int(round(float(seconds))))
+    try:
+        total_sec = max(0, int(round(float(seconds or 0))))
+    except (TypeError, ValueError, OverflowError):
+        total_sec = 0
     hours, remainder = divmod(total_sec, 3600)
     minutes, sec = divmod(remainder, 60)
     if hours > 0:
@@ -299,16 +309,31 @@ def parse_duration(time_val) -> int:
     return 0
 
 
-def get_track_duration(track: Track) -> int:
+def _metadata_seconds(metadata) -> float:
+    """Return a precise length in seconds from Picard metadata, or 0 when unknown."""
+    if metadata is None:
+        return 0
+    # ``Metadata.length`` holds milliseconds; ``~length`` is rounded to whole
+    # seconds for display, so it is only the fallback.
+    length_ms = getattr(metadata, "length", None)
+    if isinstance(length_ms, (int, float)) and not isinstance(length_ms, bool) and length_ms > 0:
+        return round(length_ms / 1000.0, 3)
+    try:
+        formatted = metadata.get("~length")
+    except Exception:
+        formatted = None
+    return parse_duration(str(formatted)) if formatted else 0
+
+
+def get_track_duration(track: Track) -> int | float:
     """Extracts duration in seconds from track or file metadata."""
-    metadata = getattr(track, "metadata", None)
-    if metadata and metadata.get("~length"):
-        return parse_duration(str(metadata["~length"]))
-    files = getattr(track, "files", [])
-    if files:
-        tr_meta = getattr(files[0], "metadata", None)
-        if tr_meta and tr_meta.get("~length"):
-            return parse_duration(str(tr_meta["~length"]))
+    length = _metadata_seconds(getattr(track, "metadata", None))
+    if length:
+        return length
+    for file in getattr(track, "files", None) or []:
+        length = _metadata_seconds(getattr(file, "metadata", None))
+        if length:
+            return length
     return 0
 
 
@@ -327,175 +352,41 @@ def truncate_text(text: str, max_lines: int = 6, max_chars_per_line: int = 55) -
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# TTML & LRC Format Handlers
-# ---------------------------------------------------------------------------
-def parse_ttml_time(time_str: str) -> tuple[int, float]:
-    """Parses TTML timestamp format (mm:ss.xxx, hh:mm:ss.xxx, or xxx.xxxs) into (minutes, seconds)."""
-    clean_str = time_str.strip().rstrip("s")
-    parts = clean_str.split(":")
-    if len(parts) == 2:
-        mm = int(parts[0])
-        ss = float(parts[1])
-    elif len(parts) == 3:
-        hh = int(parts[0])
-        mm = int(parts[1]) + hh * 60
-        ss = float(parts[2])
-    else:
-        sec_val = float(clean_str)
-        mm = int(sec_val // 60)
-        ss = sec_val % 60
-    return mm, ss
-
-
 def is_ttml_content(text: str) -> bool:
     """Checks whether the given string is TTML XML."""
     if not text:
         return False
-    stripped = text.strip()
+    stripped = text.lstrip("\ufeff \t\r\n")
     return stripped.startswith("<tt") or stripped.startswith("<?xml") or "<tt xmlns=" in text
 
 
-def ttml_to_lrc(ttml_content: str, word_synced: bool = False) -> str:
-    """Converts TTML (Timed Text Markup Language) XML into standard or word-synced LRC."""
-    try:
-        root = ET.fromstring(ttml_content)
-    except Exception as e:
-        log.warning(f"{PLUGIN_NAME}: Failed to parse TTML XML: {e}")
-        return ""
-
-    lines = []
-    for elem in root.iter():
-        tag = elem.tag.split("}")[-1] if "}" in elem.tag else elem.tag
-        if tag == "p":
-            begin = elem.get("begin")
-            if not begin:
-                continue
-            mm, ss = parse_ttml_time(begin)
-            line_ts = f"[{mm:02d}:{ss:05.2f}]"
-
-            spans = [
-                e for e in elem.iter()
-                if (e.tag.split("}")[-1] if "}" in e.tag else e.tag) == "span"
-                and e.get("begin")
-            ]
-
-            if word_synced and spans:
-                words = []
-                for s in spans:
-                    s_begin = s.get("begin")
-                    s_mm, s_ss = parse_ttml_time(s_begin)
-                    word_text = "".join(s.itertext())
-                    words.append(f"<{s_mm:02d}:{s_ss:05.2f}>{word_text}")
-                text = "".join(words).strip()
-            else:
-                text = "".join(elem.itertext()).strip()
-                text = re.sub(r"\s+", " ", text)
-
-            if text:
-                lines.append(f"{line_ts}{text}")
-
-    return "\n".join(lines)
+def _parse_lyrics_text(raw: str) -> dict:
+    return parse_ttml(raw) if is_ttml_content(raw) else parse_lrc(raw)
 
 
-def lrc_to_ttml(lrc_text: str, title: str = "", artist: str = "") -> str:
-    """Converts LRC lines into a standard TTML (Timed Text Markup Language) XML document."""
-    line_regex = re.compile(r"\[(\d{1,2}):(\d{2})(?:\.(\d+))?\](.*)")
-    body_lines = []
-
-    for line in lrc_text.splitlines():
-        match = line_regex.match(line.strip())
-        if match:
-            mm = int(match.group(1))
-            ss = int(match.group(2))
-            ms_str = match.group(3) or "0"
-            ms = float(f"0.{ms_str}") if ms_str else 0.0
-            text = match.group(4).strip()
-            text = re.sub(r"<\d{1,2}:\d{2}(?:\.\d+)?>", "", text).strip()
-            if text:
-                time_fmt = f"{mm:02d}:{ss:02d}.{int(ms * 1000):03d}"
-                escaped = (
-                    text.replace("&", "&amp;")
-                    .replace("<", "&lt;")
-                    .replace(">", "&gt;")
-                )
-                body_lines.append(f'      <p begin="{time_fmt}">{escaped}</p>')
-
-    escaped_title = (title or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    escaped_artist = (artist or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-    ttml = (
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<tt xmlns="http://www.w3.org/ns/ttml" xmlns:ttm="http://www.w3.org/ns/ttml#metadata">\n'
-        '  <head>\n'
-        '    <metadata>\n'
-        f'      <ttm:title>{escaped_title}</ttm:title>\n'
-        f'      <ttm:agent type="person" xml:id="v1">{escaped_artist}</ttm:agent>\n'
-        '    </metadata>\n'
-        '  </head>\n'
-        '  <body>\n'
-        '    <div>\n'
-        f"{chr(10).join(body_lines)}\n"
-        '    </div>\n'
-        '  </body>\n'
-        '</tt>'
-    )
-    return ttml
-
-
-def clean_word_timestamps(lrc_text: str) -> str:
-    """Strips word-by-word timestamps <mm:ss.xx> from LRC text."""
-    if not lrc_text:
-        return ""
-    word_pattern = re.compile(r"<\d{1,2}:\d{2}(?:\.\d+)?>")
-    cleaned_lines = []
-    for line in lrc_text.splitlines():
-        cleaned_lines.append(word_pattern.sub("", line).rstrip())
-    return "\n".join(cleaned_lines)
-
-
-def is_lrc_synced(lrc_text: str) -> bool:
-    """Checks whether the lyrics contain line or word timestamps."""
-    if not lrc_text:
-        return False
-    return bool(re.search(r"\[\d{1,2}:\d{2}(?:\.\d+)?\]", lrc_text))
+def _normalize_isrc(value) -> str:
+    """Normalizes ISRC formatting without changing its identity."""
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
 
 
 # ---------------------------------------------------------------------------
-# Concurrency Primitives: Rate Limiter, TTL Cache & Queue Globals
+# Shared State: HTTP Client, Persistent Cache & Queue Globals
 # ---------------------------------------------------------------------------
-# Sentinel used to distinguish a genuine cache miss from a cached ``None``.
-_CACHE_MISS = object()
-
-# Retry policy for transient HTTP failures (429 / 5xx / connection errors).
-HTTP_RETRIES = 2
-RETRY_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
-_BACKOFF_BASE = 0.5  # seconds
-_BACKOFF_MAX = 4.0  # seconds cap
-_NEGATIVE_CACHE_TTL = 30.0  # seconds to remember a failed lookup (anti-hammering)
-
-# Response caches (TTL, bounded LRU). One for raw text, one for parsed JSON.
-_HTTP_TEXT_CACHE = None  # initialised in _init_caches() to avoid import-time work
-_JSON_CACHE = None
-
-# Global outbound-request pacer, shared by worker threads and the main thread.
-_RATE_LIMITER = None
-
 # Foreground/background fetch queue (created lazily, started from ``enable``).
 FETCH_QUEUE = None
 
 # Main-thread dispatcher used by worker threads to apply results safely.
 _MAIN_INVOKER = None
 
-# Optional provider client and persistent bundle cache.  They are created only
-# after Picard enables the plugin, so importing the module stays side-effect free.
+# Shared HTTP client and persistent bundle cache.  They are created only after
+# Picard enables the plugin, so importing the module stays side-effect free.
+# Closing the client on disable cancels every in-flight request.
 _PROVIDER_HTTP = None
 _LYRICS_STORE = None
 
 
 def _lyrics_store_path() -> str:
     """Return a user-data path, never a path inside the installed plugin."""
-    api = get_plugin_api()
     app_data = None
     try:
         app_data = QtCore.QStandardPaths.writableLocation(
@@ -504,10 +395,15 @@ def _lyrics_store_path() -> str:
     except Exception:
         pass
     if not app_data:
-        app_data = os.path.join(
-            os.path.expanduser("~"), "Library", "Application Support", "MusicBrainz", "Picard"
-        )
+        app_data = os.path.join(os.path.expanduser("~"), ".betterlyrics-picard")
     return os.path.join(app_data, "betterlyrics_cache.sqlite3")
+
+
+def _init_caches() -> None:
+    """Creates the fetch queue singleton exactly once."""
+    global FETCH_QUEUE
+    if FETCH_QUEUE is None:
+        FETCH_QUEUE = FetchQueue()
 
 
 def _provider_request_json(url: str, params=None, headers=None):
@@ -516,236 +412,42 @@ def _provider_request_json(url: str, params=None, headers=None):
     return _PROVIDER_HTTP.request_json(url, params=params, headers=headers)
 
 
-class RateLimiter:
-    """Thread-safe minimum-interval limiter that paces outbound requests.
+def _log_http_failure(url: str, result) -> None:
+    # A miss or a cancellation during disable is expected; anything else is
+    # worth a warning.  Only the host and path are logged, never the query.
+    if result.status in ("not_found", "cancelled"):
+        return
+    parts = re.match(r"^(https://[^/?#]+[^?#]*)", url)
+    where = parts.group(1) if parts else "provider"
+    code = f" HTTP {result.status_code}" if result.status_code else ""
+    log.warning(f"{PLUGIN_NAME}: request to {where} failed: {result.status}{code}")
 
-    Only one caller is ever allowed to pass per ``min_interval`` window, so the
-    plugin can never burst-hammer an API regardless of how many jobs run in
-    parallel.  Callers block briefly instead of failing.
+
+def fetch_json(url: str, params: dict | None = None):
+    """Paced, cached, retrying HTTPS GET that parses a JSON response.
+
+    Returns ``None`` on any failure, or when the plugin is not enabled.
     """
-
-    def __init__(self, min_interval: float = 0.0):
-        self._min_interval = max(0.0, float(min_interval))
-        self._lock = threading.Lock()
-        self._next_allowed = 0.0
-
-    def set_interval(self, min_interval: float) -> None:
-        with self._lock:
-            self._min_interval = max(0.0, float(min_interval))
-
-    @property
-    def interval(self) -> float:
-        return self._min_interval
-
-    def acquire(self) -> None:
-        """Blocks until the next request slot is available, then claims it."""
-        if self._min_interval <= 0:
-            return
-        with self._lock:
-            now = time.monotonic()
-            wait = self._next_allowed - now
-            if wait > 0:
-                time.sleep(wait)
-                now = time.monotonic()
-            self._next_allowed = now + self._min_interval
-
-
-class TTLCache:
-    """Small thread-safe LRU cache with per-entry time-to-live.
-
-    Values may legitimately be ``None`` (negative caching); use :meth:`get`
-    together with the ``_CACHE_MISS`` sentinel to tell a miss from a cached
-    ``None``.
-    """
-
-    def __init__(self, max_entries: int = 512, ttl: float = 1800.0):
-        self._lock = threading.Lock()
-        self._store: "OrderedDict[object, tuple]" = OrderedDict()
-        self._max_entries = max(1, int(max_entries))
-        self._ttl = float(ttl)
-
-    def get(self, key, default=None):
-        with self._lock:
-            item = self._store.get(key)
-            if item is None:
-                return default
-            value, expires = item
-            if expires < time.monotonic():
-                self._store.pop(key, None)
-                return default
-            self._store.move_to_end(key)
-            return value
-
-    def set(self, key, value, ttl: float | None = None) -> None:
-        expiry = time.monotonic() + (self._ttl if ttl is None else float(ttl))
-        with self._lock:
-            self._store[key] = (value, expiry)
-            self._store.move_to_end(key)
-            while len(self._store) > self._max_entries:
-                self._store.popitem(last=False)
-
-    def clear(self) -> None:
-        with self._lock:
-            self._store.clear()
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._store)
-
-
-def _init_caches() -> None:
-    """Creates the module-level caches/limiter/queue singletons exactly once."""
-    global _HTTP_TEXT_CACHE, _JSON_CACHE, _RATE_LIMITER, FETCH_QUEUE
-    if _HTTP_TEXT_CACHE is None:
-        _HTTP_TEXT_CACHE = TTLCache(max_entries=256, ttl=1800.0)
-    if _JSON_CACHE is None:
-        _JSON_CACHE = TTLCache(max_entries=512, ttl=900.0)
-    if _RATE_LIMITER is None:
-        _RATE_LIMITER = RateLimiter(0.2)
-    if FETCH_QUEUE is None:
-        FETCH_QUEUE = FetchQueue()
-
-
-# ---------------------------------------------------------------------------
-# HTTP Networking Helpers
-# ---------------------------------------------------------------------------
-def _get_ssl_context():
-    """Returns the verified default SSL context used for HTTPS requests."""
-    try:
-        return create_ssl_context()
-    except Exception as e:
-        log.error(f"{PLUGIN_NAME}: Failed to create a verified SSL context: {e}", exc_info=True)
-        raise
-
-
-def _build_url(url: str, params: dict | None) -> str:
-    """Appends query parameters to a URL when present."""
-    if not params:
-        return url
-    query = urlencode(params)
-    sep = "&" if "?" in url else "?"
-    return f"{url}{sep}{query}"
-
-
-def _http_get(req, timeout: int):
-    """Performs a single HTTP GET. Returns (status, body); raises on network error."""
-    resp = urlopen(req, timeout=timeout, context=_get_ssl_context())
-    with resp:
-        return resp.status, resp.read().decode("utf-8", errors="replace")
-
-
-def _http_get_with_retry(req, timeout: int, retries: int = HTTP_RETRIES) -> str | None:
-    """Throttled HTTP GET with exponential backoff for transient failures.
-
-    Every outbound attempt first passes through the shared :class:`RateLimiter`,
-    so parallel workers never burst-hammer an API. Transient failures
-    (connection errors, 429 and 5xx responses) are retried with jittered
-    exponential backoff. Returns the body on success, else ``None``.
-    """
-    _init_caches()
-    last_error = None
-    last_status = None
-
-    for attempt in range(retries + 1):
-        _RATE_LIMITER.acquire()
-        try:
-            status, body = _http_get(req, timeout)
-        except HTTPError as e:
-            status = e.code
-            last_status = status
-            last_error = None
-            try:
-                e.close()
-            except Exception:
-                pass
-        except Exception as e:
-            last_error = e
-            status = None
-        else:
-            last_error = None
-            if status == 200:
-                return body
-            last_status = status
-
-        retryable = status is None or status in RETRY_STATUS_CODES
-        if not retryable or attempt >= retries:
-            break
-
-        delay = min(_BACKOFF_MAX, _BACKOFF_BASE * (2 ** attempt)) + random.uniform(0.0, 0.25)
-        log.debug(
-            f"{PLUGIN_NAME}: retrying {req.full_url} after "
-            f"{'network error' if status is None else f'HTTP {status}'} "
-            f"(attempt {attempt + 1}/{retries}, waiting {delay:.2f}s)"
-        )
-        time.sleep(delay)
-
-    if last_error is not None:
-        log.warning(f"{PLUGIN_NAME}: request failed for {req.full_url}: {last_error}")
-    elif last_status is not None and last_status != 200:
-        log.warning(f"{PLUGIN_NAME}: HTTP {last_status} for {req.full_url}")
+    client = _PROVIDER_HTTP
+    if client is None:
+        return None
+    result = client.request_json(url, params=params, headers={"Accept": "application/json"})
+    if result.status == "hit":
+        return result.data
+    _log_http_failure(url, result)
     return None
 
 
-def fetch_json(
-    url: str,
-    params: dict | None = None,
-    headers: dict | None = None,
-    timeout: int = 10,
-    use_cache: bool = True,
-):
-    """Throttled, cached, retrying HTTP GET that parses a JSON response.
-
-    Successful responses are cached for 15 minutes; failures are cached briefly
-    (negative caching) so a broken endpoint is not hammered.
-    """
-    _init_caches()
-    full_url = _build_url(url, params)
-
-    if use_cache:
-        cached = _JSON_CACHE.get(full_url, _CACHE_MISS)
-        if cached is not _CACHE_MISS:
-            return cached
-
-    req_headers = {"User-Agent": DEFAULT_USER_AGENT, "Accept": "application/json"}
-    if headers:
-        req_headers.update(headers)
-
-    body = _http_get_with_retry(Request(full_url, headers=req_headers), timeout)
-
-    data = None
-    if body is not None:
-        try:
-            data = json.loads(body)
-        except Exception as e:
-            log.warning(f"{PLUGIN_NAME}: invalid JSON from {full_url}: {e}")
-            data = None
-
-    if use_cache:
-        ttl = None if data is not None else _NEGATIVE_CACHE_TTL
-        _JSON_CACHE.set(full_url, data, ttl=ttl)
-    return data
-
-
-def fetch_text(
-    url: str,
-    timeout: int = 10,
-    use_cache: bool = True,
-    cache_ttl: float | None = None,
-) -> str | None:
-    """Throttled, cached, retrying HTTP GET returning the raw text response."""
-    _init_caches()
-
-    if use_cache:
-        cached = _HTTP_TEXT_CACHE.get(url, _CACHE_MISS)
-        if cached is not _CACHE_MISS:
-            return cached
-
-    body = _http_get_with_retry(Request(url, headers={"User-Agent": DEFAULT_USER_AGENT}), timeout)
-
-    if use_cache:
-        ttl = cache_ttl if body is not None else _NEGATIVE_CACHE_TTL
-        _HTTP_TEXT_CACHE.set(url, body, ttl=ttl)
-    return body
+def fetch_text(url: str) -> str | None:
+    """Paced, cached, retrying HTTPS GET returning the raw text response."""
+    client = _PROVIDER_HTTP
+    if client is None:
+        return None
+    result = client.request_text(url)
+    if result.status == "hit" and isinstance(result.data, str):
+        return result.data
+    _log_http_failure(url, result)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -921,25 +623,37 @@ class FetchQueue:
     """A bounded worker pool that moves lyrics fetching off the UI thread.
 
     Stability & anti-abuse features:
-      * a configurable, bounded worker pool instead of an unbounded burst,
+      * a configurable, bounded worker pool that can be resized while running,
       * deduplication of identical in-flight jobs (``key``),
-      * graceful start/stop,
+      * a non-blocking stop that discards queued work,
       * results delivered back to the GUI thread via :class:`MainThreadDispatcher`.
+
+    Every ``start`` opens a new generation with its own queue.  A worker still
+    finishing a request from an earlier generation can therefore never take
+    new work, release a new job's dedup key, or post a stale result.
     """
+
+    _IDLE_POLL = 0.5  # seconds between an idle worker's retirement checks
 
     def __init__(self, max_workers: int = 3):
         self._max_workers = max(1, int(max_workers))
-        self._queue: "queue.Queue" = queue.Queue()
-        self._workers: list = []
         self._lock = threading.Lock()
+        self._queue: "queue.Queue" = queue.Queue()
+        self._workers: dict[int, threading.Thread] = {}
         self._pending_keys: set = set()
         self._running = False
+        self._generation = 0
         self._invoker = None
         self._active = 0
 
     def configure(self, max_workers: int | None = None) -> None:
-        if max_workers is not None:
+        """Sets the pool size; a running pool grows now and shrinks as workers go idle."""
+        if max_workers is None:
+            return
+        with self._lock:
             self._max_workers = max(1, int(max_workers))
+            if self._running:
+                self._spawn_missing_workers()
 
     def set_invoker(self, invoker) -> None:
         self._invoker = invoker
@@ -970,209 +684,102 @@ class FetchQueue:
             if self._running:
                 return
             self._running = True
-            self._workers = [
-                threading.Thread(
-                    target=self._worker_loop,
-                    name=f"BetterLyricsFetch-{i}",
-                    daemon=True,
-                )
-                for i in range(self._max_workers)
-            ]
-        for worker in self._workers:
-            worker.start()
+            self._generation += 1
+            self._queue = queue.Queue()
+            self._workers = {}
+            self._spawn_missing_workers()
         log.debug(f"{PLUGIN_NAME}: fetch queue started ({self._max_workers} worker(s))")
 
-    def stop(self) -> None:
-        """Signals workers to drain the queue and exit, then joins them."""
+    def _spawn_missing_workers(self) -> None:
+        # Caller holds ``self._lock``.
+        for slot in range(self._max_workers):
+            worker = self._workers.get(slot)
+            if worker is not None and worker.is_alive():
+                continue
+            worker = threading.Thread(
+                target=self._worker_loop,
+                args=(self._generation, slot, self._queue),
+                name=f"BetterLyricsFetch-{self._generation}-{slot}",
+                daemon=True,
+            )
+            self._workers[slot] = worker
+            worker.start()
+
+    def stop(self, timeout: float = 1.0) -> None:
+        """Discards queued jobs and lets workers exit without blocking Picard.
+
+        Requests already in flight are cancelled by closing the HTTP client;
+        workers are joined only briefly, so disabling the plugin never hangs.
+        """
         with self._lock:
             if not self._running:
                 return
             self._running = False
-            workers = list(self._workers)
-            self._workers = []
-        for _ in workers:
-            self._queue.put(None)  # poison pill enqueued after pending work
-        for worker in workers:
-            worker.join(timeout=5.0)
-        with self._lock:
+            self._generation += 1
+            old_queue = self._queue
+            self._queue = queue.Queue()
+            workers = list(self._workers.values())
+            self._workers = {}
             self._pending_keys.clear()
             self._active = 0
-        log.debug(f"{PLUGIN_NAME}: fetch queue stopped")
+        discarded = 0
+        while True:
+            try:
+                old_queue.get_nowait()
+            except queue.Empty:
+                break
+            discarded += 1
+        deadline = time.monotonic() + max(0.0, timeout)
+        for worker in workers:
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        log.debug(f"{PLUGIN_NAME}: fetch queue stopped ({discarded} queued job(s) discarded)")
 
     def submit(self, job_fn, apply_fn=None, key=None) -> bool:
         """Enqueues a job. Returns ``False`` if an identical job is already pending."""
-        if key is not None:
-            with self._lock:
+        with self._lock:
+            if key is not None:
                 if key in self._pending_keys:
                     return False
                 self._pending_keys.add(key)
-        self._queue.put(_FetchTask(job_fn, apply_fn, key))
+            self._queue.put(_FetchTask(job_fn, apply_fn, key))
         return True
 
-    def _release_key(self, key) -> None:
-        if key is None:
-            return
-        with self._lock:
-            self._pending_keys.discard(key)
+    def _is_current(self, generation: int) -> bool:
+        return self._running and generation == self._generation
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, generation: int, slot: int, work_queue: "queue.Queue") -> None:
         while True:
-            task = self._queue.get()
-            if task is not None:
-                with self._lock:
-                    self._active += 1
-            try:
-                if task is None:
+            with self._lock:
+                if not self._is_current(generation) or slot >= self._max_workers:
                     return
+            try:
+                task = work_queue.get(timeout=self._IDLE_POLL)
+            except queue.Empty:
+                continue
+            with self._lock:
+                if not self._is_current(generation):
+                    return
+                self._active += 1
+            try:
                 try:
                     result = task.job_fn()
                 except Exception as e:
-                    log.warning(f"{PLUGIN_NAME}: background fetch job failed: {e}")
+                    log.warning(f"{PLUGIN_NAME}: background fetch job failed: {type(e).__name__}: {e}")
                     result = None
-                if task.apply_fn is not None:
+                with self._lock:
+                    current = self._is_current(generation)
+                if task.apply_fn is not None and current:
                     invoker = self._invoker
                     if invoker is not None:
                         invoker.post(partial(task.apply_fn, result))
                     else:
                         log.debug(f"{PLUGIN_NAME}: no main-thread invoker; result dropped")
             finally:
-                if task is not None:
-                    with self._lock:
+                with self._lock:
+                    if generation == self._generation:
                         self._active = max(0, self._active - 1)
-                self._release_key(getattr(task, "key", None))
-                self._queue.task_done()
-
-
-# ---------------------------------------------------------------------------
-# Match Scoring Algorithm
-# ---------------------------------------------------------------------------
-def _normalize_match_text(value) -> str:
-    """Normalizes metadata enough for stable, punctuation-insensitive matching."""
-    text = str(value or "").casefold()
-    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
-    return " ".join(text.split())
-
-
-def _text_similarity(left, right) -> float:
-    left_normalized = _normalize_match_text(left)
-    right_normalized = _normalize_match_text(right)
-    if not left_normalized or not right_normalized:
-        return 0.0
-    return SequenceMatcher(None, left_normalized, right_normalized).ratio()
-
-
-def _normalize_isrc(value) -> str:
-    """Normalizes ISRC formatting without changing its identity."""
-    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
-
-
-def _duration_similarity(target_duration: int, item_duration: int, tolerance: int) -> float:
-    """Returns a duration score that reaches zero outside twice the tolerance."""
-    if target_duration <= 0 or item_duration <= 0:
-        return 0.0
-    diff = abs(target_duration - item_duration)
-    tolerance = max(0, int(tolerance))
-    if tolerance == 0:
-        return 1.0 if diff == 0 else 0.0
-    if diff <= tolerance:
-        # A small duration drift is expected, but an exact duration still wins.
-        return 1.0 - 0.4 * (diff / tolerance)
-    return max(0.0, 0.6 * (1.0 - ((diff - tolerance) / tolerance)))
-
-
-def _has_exact_isrc(target_isrc: str | None, item_isrc: str | None) -> bool:
-    target = _normalize_isrc(target_isrc)
-    item = _normalize_isrc(item_isrc)
-    return bool(target and item and target == item)
-
-
-def calculate_match_score(
-    target_title: str,
-    target_artist: str,
-    target_album: str | None,
-    target_duration: int,
-    target_isrc: str | None,
-    item: dict,
-    duration_tolerance: int = 5,
-) -> float:
-    """Calculates a weighted match confidence score between 0.0 and 1.0.
-
-    Missing metadata contributes zero rather than receiving a false bonus.  A
-    synchronized result is intentionally not part of this identity score; it
-    is a preference-only tie breaker in :func:`query_all_sources`.
-    """
-    item_title = item.get("title", "")
-    item_artist = item.get("artist", "")
-    item_album = item.get("album", "")
-    item_duration = parse_duration(item.get("duration", 0))
-    item_isrc = item.get("isrc")
-
-    score = 0.0
-
-    if _has_exact_isrc(target_isrc, item_isrc):
-        score += MATCH_WEIGHTS["isrc"]
-
-    if target_title and item_title:
-        score += _text_similarity(target_title, item_title) * MATCH_WEIGHTS["title"]
-
-    if target_artist and item_artist:
-        score += _text_similarity(target_artist, item_artist) * MATCH_WEIGHTS["artist"]
-
-    if target_album and item_album:
-        score += _text_similarity(target_album, item_album) * MATCH_WEIGHTS["album"]
-
-    if target_duration and item_duration:
-        score += _duration_similarity(
-            parse_duration(target_duration), item_duration, duration_tolerance
-        ) * MATCH_WEIGHTS["duration"]
-
-    return max(0.0, min(1.0, score))
-
-
-def _candidate_is_compatible(
-    target_title: str,
-    target_artist: str,
-    target_duration: int,
-    target_isrc: str,
-    item: dict,
-    tolerance: int,
-) -> bool:
-    """Rejects identity conflicts before lyrics content is downloaded."""
-    # ``query_all_sources`` already annotates provider results with the
-    # standalone matcher. Do not apply the legacy score floor a second time:
-    # exact provider lookups (notably Boidu and LRCLIB /api/get) can be valid
-    # even when the response has sparse metadata and therefore a low score.
-    if "match_eligible" in item:
-        return bool(item.get("match_eligible"))
-    item_isrc = item.get("isrc")
-    exact_isrc = _has_exact_isrc(target_isrc, item_isrc)
-    normalized_target_isrc = _normalize_isrc(target_isrc)
-    normalized_item_isrc = _normalize_isrc(item_isrc)
-
-    if normalized_target_isrc and normalized_item_isrc and not exact_isrc:
-        return False
-
-    # An exact ISRC is authoritative. Providers may format title/artist
-    # metadata differently, so text gates are only applied when ISRC is absent.
-    item_title = item.get("title", "")
-    item_artist = item.get("artist", "")
-    if not exact_isrc:
-        if target_title and not item_title:
-            return False
-        if target_artist and not item_artist:
-            return False
-        if target_title and _text_similarity(target_title, item_title) < 0.55:
-            return False
-        if target_artist and _text_similarity(target_artist, item_artist) < 0.45:
-            return False
-        if item.get("score", 0.0) < MATCH_MIN_SCORE_WITHOUT_ISRC:
-            return False
-
-    item_duration = parse_duration(item.get("duration", 0))
-    if target_duration > 0 and item_duration > 0:
-        if abs(target_duration - item_duration) > max(0, int(tolerance)) and not exact_isrc:
-            return False
-    return True
+                        if task.key is not None:
+                            self._pending_keys.discard(task.key)
 
 
 # ---------------------------------------------------------------------------
@@ -1188,13 +795,14 @@ def search_lrcred(
     """Uses the documented ISRC resource and the website's text-search API."""
     candidates = []
     seen_ids = set()
-    isrc_pattern = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}[0-9]{7}$")
 
     def valid_isrc(value):
         normalized = _normalize_isrc(value)
-        return normalized if isrc_pattern.fullmatch(normalized) else ""
+        return normalized if ISRC_PATTERN.fullmatch(normalized) else ""
 
     def safe_duration(value):
+        if isinstance(value, bool):
+            return 0
         try:
             seconds = float(value)
         except (TypeError, ValueError, OverflowError):
@@ -1202,6 +810,10 @@ def search_lrcred(
         if seconds != seconds or seconds in (float("inf"), float("-inf")) or seconds < 0:
             return 0
         return seconds
+
+    def text_field(res, key):
+        value = res.get(key, "")
+        return value if isinstance(value, str) else ""
 
     def map_result(res):
         if not isinstance(res, dict):
@@ -1221,14 +833,13 @@ def search_lrcred(
 
         # Search hits omit sync information; absence does not mean plain text.
         timing_type = res.get("sync") or res.get("timing_type") or "unknown"
-        if not isinstance(timing_type, str):
-            timing_type = "unknown"
+        timing_type = timing_type.lower() if isinstance(timing_type, str) else "unknown"
 
         return {
             "id": normalized_isrc,
-            "title": res.get("title", "") if isinstance(res.get("title", ""), str) else "",
-            "artist": res.get("artist", "") if isinstance(res.get("artist", ""), str) else "",
-            "album": res.get("album", "") if isinstance(res.get("album", ""), str) else "",
+            "title": text_field(res, "title"),
+            "artist": text_field(res, "artist"),
+            "album": text_field(res, "album"),
             "duration": safe_duration(res.get("duration", 0)),
             "isrc": normalized_isrc,
             "timing_type": timing_type,
@@ -1253,12 +864,13 @@ def search_lrcred(
     # An explicit search is authoritative; it must not return a stale track ISRC.
     search_q = query.strip() if isinstance(query, str) else ""
 
-    # 1. Resolve a validated ISRC through LRC.red's single-object resource.
-    normalized_isrc = valid_isrc(isrc) if not search_q else ""
-    if normalized_isrc:
-        data = fetch_json(f"{LRC_RED_BASE_URL}/s/{normalized_isrc}.json")
-        if isinstance(data, dict) and valid_isrc(data.get("isrc")) == normalized_isrc:
-            add_res(data)
+    # 1. Resolve each validated ISRC through LRC.red's single-object resource.
+    # Picard joins multi-valued tags with "; ", so a recording may carry several.
+    if not search_q:
+        for normalized_isrc in sorted(normalize_isrcs(isrc)):
+            data = fetch_json(f"{LRC_RED_BASE_URL}/s/{normalized_isrc}.json")
+            if isinstance(data, dict) and valid_isrc(data.get("isrc")) == normalized_isrc:
+                add_res(data)
         if candidates:
             return candidates
 
@@ -1302,31 +914,68 @@ def search_unison(
     seen_ids = set()
 
     search_q = query or f"{artist} {title}".strip() or title
-    if search_q:
-        data = fetch_json(UNISON_SEARCH_URL, {"q": search_q})
-        if data and isinstance(data, dict) and data.get("success"):
-            for res in data.get("data", []):
-                c_id = res.get("id")
-                if c_id in seen_ids:
-                    continue
-                seen_ids.add(c_id)
-                candidates.append({
-                    "id": c_id,
-                    "title": res.get("song", ""),
-                    "artist": res.get("artist", ""),
-                    "album": res.get("album", ""),
-                    "duration": res.get("duration", 0),
-                    "isrc": res.get("isrc", ""),
-                    "timing_type": res.get("syncType", "plain"),
-                    "format": res.get("format", "ttml"),
-                    "source": "Unison",
-                    "provider_id": "unison",
-                    "metadata_verified": True,
-                    "direct_lyrics": res.get("lyrics"),
-                    "raw": res,
-                })
+    if not search_q:
+        return candidates
+    data = fetch_json(UNISON_SEARCH_URL, {"q": search_q})
+    if not isinstance(data, dict) or not data.get("success"):
+        return candidates
+    rows = data.get("data")
+    for res in rows if isinstance(rows, list) else []:
+        if not isinstance(res, dict):
+            continue
+        c_id = res.get("id")
+        if c_id is None or isinstance(c_id, (dict, list)) or c_id in seen_ids:
+            continue
+        seen_ids.add(c_id)
+        timing = res.get("syncType")
+        direct = res.get("lyrics")
+        fmt = res.get("format")
+        candidates.append({
+            "id": c_id,
+            "title": res.get("song") if isinstance(res.get("song"), str) else "",
+            "artist": res.get("artist") if isinstance(res.get("artist"), str) else "",
+            "album": res.get("album") if isinstance(res.get("album"), str) else "",
+            "duration": res.get("duration") if isinstance(res.get("duration"), (int, float)) else 0,
+            "isrc": res.get("isrc") if isinstance(res.get("isrc"), str) else "",
+            "timing_type": timing.lower() if isinstance(timing, str) and timing else "unknown",
+            "format": fmt if isinstance(fmt, str) else "ttml",
+            "source": "Unison",
+            "provider_id": "unison",
+            "metadata_verified": True,
+            "direct_lyrics": direct if isinstance(direct, str) else None,
+            "raw": res,
+        })
 
     return candidates
+
+
+def _provider_options() -> dict:
+    """Snapshot the provider settings on the GUI thread for use by a worker."""
+    return {
+        "lyricsplus": bool(config["betterlyrics_enable_lyricsplus"]),
+        "boidu": bool(config["betterlyrics_enable_boidu"]),
+        "lrclib": bool(config["betterlyrics_enable_lrclib"]),
+        "api_key": str(config["betterlyrics_api_key"] or "").strip(),
+    }
+
+
+def _timing_rank(candidate: dict) -> int:
+    timing = candidate.get("timing_type")
+    if not isinstance(timing, str):
+        return _PLAIN_TIMING_RANK
+    return _TIMING_RANK.get(timing.lower(), _PLAIN_TIMING_RANK)
+
+
+def _search_one_provider(provider_id: str, search, *args) -> list[dict]:
+    """Run one provider search; a failing provider never aborts the others."""
+    try:
+        found = search(*args)
+    except Exception as e:
+        log.warning(f"{PLUGIN_NAME}: provider {provider_id} failed: {type(e).__name__}")
+        return []
+    found = [item for item in found or [] if isinstance(item, dict)]
+    log.info(f"{PLUGIN_NAME}: provider {provider_id} returned {len(found)} candidate(s)")
+    return found
 
 
 def query_all_sources(
@@ -1339,28 +988,32 @@ def query_all_sources(
     source_preference: str = "all",
     duration_tolerance: int | None = None,
     prefer_synced: bool | None = None,
+    provider_options: dict | None = None,
 ) -> list[dict]:
-    """Queries configured providers and ranks candidates by recording identity."""
+    """Queries configured providers and ranks candidates by recording identity.
+
+    Eligible candidates come first, then higher identity scores; synchronized
+    lyrics only break ties.  Workers must pass every optional argument, since
+    the defaults read Picard's config, which belongs to the GUI thread.
+    """
     results = []
 
     if duration_tolerance is None:
         duration_tolerance = _config_int(get_plugin_api(), "betterlyrics_duration_tolerance", 5)
     if prefer_synced is None:
         prefer_synced = bool(config["betterlyrics_prefer_synced"])
+    if provider_options is None:
+        provider_options = _provider_options()
 
     pref = source_preference or "all"
-    if pref not in ("all", "lrcred", "unison", "lyricsplus", "boidu", "lrclib"):
+    if pref not in ("all",) + PROVIDER_IDS:
         pref = "all"
 
     if pref in ("all", "lrcred"):
-        found = search_lrcred(title, artist, album, isrc, query)
-        results.extend(found)
-        log.info(f"{PLUGIN_NAME}: provider lrcred returned {len(found)} candidate(s)")
+        results.extend(_search_one_provider("lrcred", search_lrcred, title, artist, album, isrc, query))
 
     if pref in ("all", "unison"):
-        found = search_unison(title, artist, album, duration, query)
-        results.extend(found)
-        log.info(f"{PLUGIN_NAME}: provider unison returned {len(found)} candidate(s)")
+        results.extend(_search_one_provider("unison", search_unison, title, artist, album, duration, query))
 
     target = {
         "title": title,
@@ -1370,62 +1023,80 @@ def query_all_sources(
         "isrc": isrc,
         "query": query,
     }
-    optional = {
-        "lyricsplus": bool(config["betterlyrics_enable_lyricsplus"]),
-        "boidu": bool(config["betterlyrics_enable_boidu"]),
-        "lrclib": bool(config["betterlyrics_enable_lrclib"]),
-    }
-    requested = list(optional) if pref == "all" else ([pref] if pref in optional else [])
+    requested = list(OPTIONAL_PROVIDER_IDS) if pref == "all" else ([pref] if pref in OPTIONAL_PROVIDER_IDS else [])
     for provider_id in requested:
-        if not optional[provider_id] and pref == "all":
+        if not provider_options.get(provider_id) and pref == "all":
             log.info(f"{PLUGIN_NAME}: provider {provider_id} skipped: disabled")
             continue
         if _PROVIDER_HTTP is None:
             log.info(f"{PLUGIN_NAME}: provider {provider_id} skipped: client unavailable")
             continue
-        result = search_provider(
-            provider_id,
-            target,
-            _provider_request_json,
-            api_key=config["betterlyrics_api_key"] if provider_id == "boidu" else "",
-        )
+        try:
+            result = search_provider(
+                provider_id,
+                target,
+                _provider_request_json,
+                api_key=provider_options.get("api_key", "") if provider_id == "boidu" else "",
+            )
+        except Exception as e:
+            log.warning(f"{PLUGIN_NAME}: provider {provider_id} failed: {type(e).__name__}")
+            continue
         status = result.get("status")
         found = result.get("candidates", []) if status == "hit" else []
         results.extend(found)
         # Provider messages may contain response bodies or credential-bearing
         # URLs. Log bounded status codes and counts instead.
-        if status not in ("hit", "not_found", "auth_required", "error", "rate_limited", "unavailable"):
+        if status not in ("hit", "not_found", "auth_required", "rate_limited",
+                          "transport_error", "invalid_response", "cancelled"):
             status = "failed"
         log.info(f"{PLUGIN_NAME}: provider {provider_id}: {status}; {len(found)} candidate(s)")
 
-    for item in results:
-        item["score"] = calculate_match_score(
-            title,
-            artist,
-            album,
-            duration,
-            isrc,
-            item,
-            duration_tolerance=duration_tolerance,
-        )
-
-    # The old providers predate the standalone matcher and may not carry an
-    # explicit verification flag. Their result metadata is still provider data;
-    # optional providers are stricter and set this flag themselves.
     ranked = rank_candidates(
         {"title": title, "artist": artist, "album": album, "duration": duration, "isrc": isrc},
         results,
         duration_tolerance,
     )
-
     ranked.sort(
         key=lambda x: (
+            bool(x.get("match_eligible")),
             x.get("score", 0.0),
-            1 if prefer_synced and x.get("timing_type") in SYNCED_TIMING_TYPES else 0,
+            1 if prefer_synced and _timing_rank(x) < _PLAIN_TIMING_RANK else 0,
         ),
         reverse=True,
     )
     return ranked
+
+
+def _lrcred_lyrics_urls(candidate: dict) -> list[str]:
+    """Collect LRC.red download URLs, TTML first, without duplicates."""
+    urls = []
+
+    def add_url(url):
+        if not isinstance(url, str):
+            return
+        url = url.strip()
+        if url and url not in urls:
+            urls.append(url)
+
+    # Prefer provider-supplied URLs independently; they need not be derived
+    # from one another (for example, a custom TTML URL and a custom LRC URL).
+    raw_candidate = candidate.get("raw")
+    raw_files = raw_candidate.get("files") if isinstance(raw_candidate, dict) else None
+    for files in (candidate.get("files"), raw_files):
+        if isinstance(files, dict):
+            add_url(files.get("ttml"))
+            add_url(files.get("lrc"))
+    add_url(candidate.get("ttml_url"))
+    add_url(candidate.get("lrc_url"))
+    add_url(candidate.get("lyrics_url"))
+
+    isrc_value = _normalize_isrc(candidate.get("isrc"))
+    if not ISRC_PATTERN.fullmatch(isrc_value):
+        isrc_value = _normalize_isrc(candidate.get("id"))
+    if ISRC_PATTERN.fullmatch(isrc_value):
+        add_url(f"{LRC_RED_BASE_URL}/s/{isrc_value}.ttml")
+        add_url(f"{LRC_RED_BASE_URL}/s/{isrc_value}.lrc")
+    return urls
 
 
 def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> dict:
@@ -1434,71 +1105,44 @@ def resolve_lyrics_bundle(candidate: dict, clean_words: bool | None = None) -> d
     ``clean_words`` lets background workers pass a config snapshot instead of
     reading plugin config from a non-GUI thread.
     """
+    if clean_words is None:
+        clean_words = bool(config["betterlyrics_clean_word_timestamps"])
     source = candidate.get("source", "")
-    raw_content = None
-
     provider_id = candidate.get("provider_id") or candidate.get("source", "")
+    empty = {"ttml": None, "lrc": None, "is_synced": False, "source": source}
+
     if provider_id == "lyricsplus" and isinstance(candidate.get("payload"), dict):
-        document = parse_kpoe(candidate["payload"])
-        bundle = make_bundle(document, clean_words=True if clean_words is None else clean_words)
+        bundle = make_bundle(parse_kpoe(candidate["payload"]), clean_words=clean_words)
         bundle["source"] = source or "LyricsPlus"
         bundle["provider_id"] = provider_id
         return bundle
 
-    if provider_id in {"boidu", "lrclib"} and isinstance(candidate.get("direct_lyrics"), str):
-        raw_content = candidate["direct_lyrics"]
+    document = None
+    direct = candidate.get("direct_lyrics")
+    if isinstance(direct, str) and direct.strip():
+        document = _parse_lyrics_text(direct)
 
-    # Handle Unison Source
-    if source == "Unison":
-        raw_content = candidate.get("direct_lyrics")
-        if not raw_content and candidate.get("id"):
-            item_data = fetch_json(f"{UNISON_API_URL}/{candidate['id']}")
-            if item_data and item_data.get("success") and item_data.get("data"):
-                raw_content = item_data["data"].get("lyrics")
-                candidate["format"] = item_data["data"].get("format", candidate.get("format", "ttml"))
+    if (document is None or not document.get("lines")) and source == "Unison" and candidate.get("id") is not None:
+        item_data = fetch_json(f"{UNISON_API_URL}/{candidate['id']}")
+        data = item_data.get("data") if isinstance(item_data, dict) and item_data.get("success") else None
+        lyrics = data.get("lyrics") if isinstance(data, dict) else None
+        if isinstance(lyrics, str) and lyrics.strip():
+            document = _parse_lyrics_text(lyrics)
 
-    # Handle LRC.red Source
-    elif source == "LRC.red":
-        urls = []
-
-        def add_url(url):
-            if not isinstance(url, str):
-                return
-            url = url.strip()
-            if url and url not in urls:
-                urls.append(url)
-
-        # Prefer provider-supplied URLs independently; they need not be derived
-        # from one another (for example, a custom TTML URL and a custom LRC URL).
-        raw_candidate = candidate.get("raw")
-        raw_files = raw_candidate.get("files") if isinstance(raw_candidate, dict) else None
-        for files in (candidate.get("files"), raw_files):
-            if isinstance(files, dict):
-                add_url(files.get("ttml"))
-                add_url(files.get("lrc"))
-        add_url(candidate.get("ttml_url"))
-        add_url(candidate.get("lrc_url"))
-        add_url(candidate.get("lyrics_url"))
-
-        isrc_value = _normalize_isrc(candidate.get("isrc"))
-        if not re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", isrc_value):
-            isrc_value = _normalize_isrc(candidate.get("id"))
-        if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{3}[0-9]{7}", isrc_value):
-            add_url(f"{LRC_RED_BASE_URL}/s/{isrc_value}.ttml")
-            add_url(f"{LRC_RED_BASE_URL}/s/{isrc_value}.lrc")
-
-        for lyrics_url in urls:
+    elif (document is None or not document.get("lines")) and source == "LRC.red":
+        # A URL can answer with an empty or unparseable body; keep trying the
+        # remaining representations instead of giving up on the candidate.
+        for lyrics_url in _lrcred_lyrics_urls(candidate):
             raw_content = fetch_text(lyrics_url)
-            if raw_content:
+            if not raw_content:
+                continue
+            document = _parse_lyrics_text(raw_content)
+            if document.get("lines"):
                 break
 
-    if not raw_content:
-        return {"ttml": None, "lrc": None, "is_synced": False, "source": source}
+    if document is None or not document.get("lines"):
+        return empty
 
-    if clean_words is None:
-        clean_words = config["betterlyrics_clean_word_timestamps"]
-
-    document = parse_ttml(raw_content) if is_ttml_content(raw_content) else parse_lrc(raw_content)
     bundle = make_bundle(document, clean_words=clean_words)
     bundle["source"] = source
     bundle["provider_id"] = provider_id
@@ -1541,8 +1185,12 @@ def _enabled_sidecars(file):
     stem = os.path.splitext(filename)[0]
     return [
         (extension, stem + "." + extension)
-        for extension in ("ttml", "lrc")
-        if config[f"betterlyrics_save_{extension}_file"]
+        for extension, option in (
+            ("ttml", "betterlyrics_save_ttml_file"),
+            ("lrc", "betterlyrics_save_lrc_file"),
+            ("txt", "betterlyrics_plain_as_txt"),
+        )
+        if config[option]
     ]
 
 
@@ -1560,6 +1208,54 @@ def _has_writable_lyrics_destination(files, track):
     )
 
 
+def _bundle_destination_values(bundle: dict) -> tuple[dict, dict]:
+    """Return the tag values and sidecar contents a bundle can fill.
+
+    Unsynchronized lyrics are written as plain text: a TTML document or an
+    ``.lrc`` file without timestamps would only mislead players.
+    """
+    ttml_content = bundle.get("ttml")
+    lrc_content = bundle.get("lrc")
+    if bundle.get("quality") == "plain":
+        plain = bundle.get("plain") or lrc_content
+        tags = {"lyrics": plain, "ttml": None, "syncedlyrics": None}
+        return tags, {"txt": plain}
+
+    if config["betterlyrics_format"] in ("ttml", "both") and ttml_content:
+        primary = ttml_content
+    else:
+        primary = lrc_content or ttml_content
+    tags = {"lyrics": primary, "ttml": ttml_content, "syncedlyrics": lrc_content or ttml_content}
+    return tags, {"ttml": ttml_content, "lrc": lrc_content}
+
+
+def _write_sidecar(path: str, content: str, overwrite: bool) -> None:
+    """Write a sidecar so readers never observe a truncated file.
+
+    Raises ``FileExistsError`` when the file exists and may not be replaced,
+    which also covers a sidecar created while the lookup was in flight.
+    """
+    if not overwrite or not os.path.exists(path):
+        with open(path, "x", encoding="utf-8") as handle:
+            handle.write(content)
+        return
+    directory = os.path.dirname(path) or "."
+    descriptor, temporary = tempfile.mkstemp(prefix=".betterlyrics-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        # mkstemp creates the file private to the user; keep the replaced
+        # sidecar's permissions so media servers can still read it.
+        shutil.copymode(path, temporary)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def save_lyrics_to_files(
     file_list: list[File],
     bundle: dict,
@@ -1575,20 +1271,11 @@ def save_lyrics_to_files(
     if not bundle:
         return False
 
-    pref_format = config["betterlyrics_format"]  # "ttml", "lrc", "both"
-    ttml_content = bundle.get("ttml")
-    lrc_content = bundle.get("lrc")
-
-    if pref_format in ("ttml", "both") and ttml_content:
-        primary_tag_content = ttml_content
-    else:
-        primary_tag_content = lrc_content or ttml_content
-
+    values, sidecar_contents = _bundle_destination_values(bundle)
+    primary_tag_content = values["lyrics"]
     if not primary_tag_content:
         return False
 
-    values = {"lyrics": primary_tag_content, "ttml": ttml_content,
-              "syncedlyrics": lrc_content or ttml_content}
     tags = {tag: values[tag] for tag in _enabled_lyric_tags() if values[tag]}
     counts = {"tags": 0, "sidecars": 0, "protected": 0, "unchanged": 0}
 
@@ -1599,6 +1286,7 @@ def save_lyrics_to_files(
     def apply_target(target, sidecars=()):
         metadata = target.metadata
         overwrite = bool(config["betterlyrics_auto_overwrite"])
+        sidecars = [(ext, path) for ext, path in sidecars if sidecar_contents.get(ext)]
         existing = any(metadata.get(tag) and not same_value(metadata, tag, value)
                        for tag, value in tags.items())
         existing = existing or any(os.path.exists(path) for _, path in sidecars)
@@ -1623,9 +1311,7 @@ def save_lyrics_to_files(
         if changed and hasattr(target, "update"):
             target.update()
         for extension, path in sidecars:
-            content = bundle.get(extension)
-            if not content:
-                continue
+            content = sidecar_contents[extension]
             exists = os.path.exists(path)
             if exists and not overwrite:
                 counts["protected"] += 1
@@ -1636,11 +1322,9 @@ def save_lyrics_to_files(
                         if handle.read() == content.encode("utf-8"):
                             counts["unchanged"] += 1
                             continue
-                # Exclusive creation also protects a sidecar created while the
-                # lookup was in flight, without copying it into metadata.
-                with open(path, "w" if overwrite else "x", encoding="utf-8") as handle:
-                    handle.write(content)
+                _write_sidecar(path, content, overwrite)
                 counts["sidecars"] += 1
+                _record_written_sidecar(target, extension, path)
                 log.info(f"{PLUGIN_NAME}: Saved {extension.upper()} file to {path}")
             except FileExistsError:
                 counts["protected"] += 1
@@ -1666,9 +1350,98 @@ def save_lyrics_to_files(
     return changed
 
 
+def _record_written_sidecar(file, extension: str, path: str) -> None:
+    try:
+        _WRITTEN_SIDECARS.setdefault(file, {})[extension] = path
+    except TypeError:
+        pass  # Objects that cannot be weakly referenced are simply not tracked.
+
+
+def _move_sidecars_with_file(file) -> None:
+    """Move sidecars this plugin wrote when Picard saved the audio elsewhere.
+
+    Sidecars are written next to the file as it was when the lyrics arrived.
+    If Picard's rename/move options relocate the audio on save, the sidecars
+    follow it instead of being left behind as orphans.  Anything that already
+    exists at the destination is left untouched.
+    """
+    try:
+        written = _WRITTEN_SIDECARS.pop(file, None)
+    except TypeError:
+        return
+    filename = getattr(file, "filename", None)
+    if not written or not filename:
+        return
+    stem = os.path.splitext(filename)[0]
+    for extension, old_path in written.items():
+        new_path = f"{stem}.{extension}"
+        if os.path.normcase(os.path.abspath(old_path)) == os.path.normcase(os.path.abspath(new_path)):
+            continue
+        if not os.path.exists(old_path):
+            continue  # Already moved, e.g. by Picard's "move additional files".
+        if os.path.exists(new_path):
+            log.info(f"{PLUGIN_NAME}: Kept {old_path}; {new_path} already exists")
+            continue
+        try:
+            os.makedirs(os.path.dirname(new_path) or ".", exist_ok=True)
+            shutil.move(old_path, new_path)
+            log.info(f"{PLUGIN_NAME}: Moved {extension.upper()} sidecar to {new_path}")
+        except OSError as err:
+            log.error(f"{PLUGIN_NAME}: Failed to move {extension.upper()} sidecar {old_path}: {err}")
+
+
 # ---------------------------------------------------------------------------
 # Interactive Search Table Dialog
 # ---------------------------------------------------------------------------
+def run_with_busy_dialog(parent, label: str, fn):
+    """Run blocking network work on a thread while Picard's UI stays responsive.
+
+    A nested event loop waits for the result behind a window-modal progress
+    dialog.  Returns ``fn()``'s result, or ``None`` when the user cancels; a
+    cancelled worker finishes in the background and its result is discarded.
+    Exceptions raised by ``fn`` propagate to the caller.
+    """
+    outcome: dict = {}
+    done = threading.Event()
+
+    def work():
+        try:
+            outcome["value"] = fn()
+        except BaseException as error:
+            outcome["error"] = error
+        finally:
+            done.set()
+
+    threading.Thread(target=work, name="BetterLyricsSearch", daemon=True).start()
+    # Cached lookups finish almost at once; skip the dialog for them.
+    if not done.wait(0.15):
+        loop = QtCore.QEventLoop()
+        progress = QtWidgets.QProgressDialog(label, "Cancel", 0, 0, parent)
+        progress.setWindowTitle(PLUGIN_NAME)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.canceled.connect(loop.quit)
+        # A busy indicator never receives setValue(), which is what would
+        # otherwise trigger QProgressDialog's delayed automatic show.
+        progress.show()
+        timer = QtCore.QTimer()
+        timer.setInterval(30)
+        timer.timeout.connect(lambda: loop.quit() if done.is_set() or progress.wasCanceled() else None)
+        timer.start()
+        try:
+            if not done.is_set():
+                loop.exec()
+        finally:
+            timer.stop()
+            progress.close()
+            progress.deleteLater()
+        if not done.is_set():
+            log.info(f"{PLUGIN_NAME}: {label.rstrip('…')} cancelled")
+            return None
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
 def show_search_dialog(
     parent,
     title: str,
@@ -1747,8 +1520,11 @@ def show_search_dialog(
         item = table.item(row, 0)
         if item is None:
             return None
-        candidate = item.data(Qt.ItemDataRole.UserRole)
-        return candidate if isinstance(candidate, dict) else None
+        # The row stores an index: PyQt would convert a dict into a lossy copy.
+        index = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(index, int) or not 0 <= index < len(current_results):
+            return None
+        return current_results[index]
 
     def populate_table(items: list[dict]):
         table.setSortingEnabled(False)
@@ -1759,14 +1535,12 @@ def show_search_dialog(
             idx_item = QtWidgets.QTableWidgetItem()
             idx_item.setTextAlignment(ALIGN_CENTER)
             idx_item.setData(Qt.ItemDataRole.EditRole, row + 1)
-            idx_item.setData(Qt.ItemDataRole.UserRole, item)
+            idx_item.setData(Qt.ItemDataRole.UserRole, row)
             table.setItem(row, 0, idx_item)
 
-            timing = item.get("timing_type", "none").lower()
-            is_synced = timing in ("word", "line", "richsync", "linesync")
-            sync_label = "TTML (Word)" if timing in ("word", "richsync") else ("TTML (Line)" if is_synced else "Plain")
-            if timing == "unknown":
-                sync_label = "Unknown (preview to check)"
+            rank = _timing_rank(item)
+            is_synced = rank < _TIMING_RANK["unknown"]
+            sync_label = ("Word-synced", "Line-synced", "Unknown (preview to check)", "Plain")[rank]
 
             values = [
                 item.get("title") or "?",
@@ -1774,7 +1548,7 @@ def show_search_dialog(
                 item.get("album") or "-",
                 format_duration(item.get("duration", 0)),
                 sync_label,
-                item.get("source", "Better Lyrics"),
+                item.get("display") or item.get("source") or "Better Lyrics",
             ]
 
             for col, val in enumerate(values, start=1):
@@ -1800,7 +1574,8 @@ def show_search_dialog(
         query_text = search_input.text().strip()
         if not query_text:
             return
-        current_results = query_all_sources(
+        search = partial(
+            query_all_sources,
             title=title,
             artist=artist,
             album=album,
@@ -1808,7 +1583,14 @@ def show_search_dialog(
             isrc=isrc,
             query=query_text,
             source_preference=config["betterlyrics_source"],
+            duration_tolerance=_config_int(get_plugin_api(), "betterlyrics_duration_tolerance", 5),
+            prefer_synced=bool(config["betterlyrics_prefer_synced"]),
+            provider_options=_provider_options(),
         )
+        found = run_with_busy_dialog(dialog, "Searching lyrics providers…", search)
+        if found is None:
+            return
+        current_results = found
         populate_table(current_results)
 
     search_button.clicked.connect(on_search)
@@ -1824,9 +1606,20 @@ def show_search_dialog(
         candidate = candidate_for_row(row)
         if candidate is None:
             return
-        bundle = resolve_lyrics_bundle(candidate)
+        resolve = partial(
+            resolve_lyrics_bundle,
+            candidate,
+            clean_words=bool(config["betterlyrics_clean_word_timestamps"]),
+        )
+        try:
+            bundle = run_with_busy_dialog(dialog, "Downloading lyrics preview…", resolve)
+        except Exception as error:
+            log.error(f"{PLUGIN_NAME}: lyrics preview failed: {type(error).__name__}: {error}")
+            bundle = {}
+        if bundle is None:
+            return
         ttml_data = bundle.get("ttml")
-        lrc_data = bundle.get("lrc")
+        lrc_data = bundle.get("lrc") or bundle.get("plain")
 
         if not ttml_data and not lrc_data:
             QtWidgets.QMessageBox.information(
@@ -1881,17 +1674,15 @@ def show_search_dialog(
 # ---------------------------------------------------------------------------
 # Core Lyrics Matcher & Fetcher
 # ---------------------------------------------------------------------------
-def _extract_track_query(metadata, track) -> tuple[str, str, str, str, int]:
+def _extract_track_query(metadata, track) -> tuple[str, str, str, str, int | float]:
     """Reads (title, artist, album, isrc, length) from Picard metadata/track."""
     title = str(metadata.get("title", "") or "").strip()
     artist = str(metadata.get("artist", "") or "").strip()
     album_name = str(metadata.get("album", "") or "").strip()
     isrc = str(metadata.get("isrc", "") or "").strip()
 
-    length = 0
-    if metadata.get("~length"):
-        length = parse_duration(str(metadata["~length"]))
-    elif track:
+    length = _metadata_seconds(metadata)
+    if not length and track:
         length = get_track_duration(track)
     return title, artist, album_name, isrc, length
 
@@ -1908,21 +1699,60 @@ def _dedup_key(track, files, method):
     return None
 
 
+def _auto_cache_key(target: dict, source_pref: str) -> str:
+    # Different source settings can legitimately pick different lyrics.
+    return f"{track_key(target)}|{source_pref or 'all'}"
+
+
+def _manual_cache_key(target: dict) -> str:
+    return f"manual|{track_key(target)}"
+
+
+def _with_lrc_style(bundle: dict, clean_words: bool) -> dict:
+    """Re-select the LRC flavour, since a cached bundle may predate a settings change."""
+    preferred = bundle.get("line_lrc" if clean_words else "enhanced_lrc")
+    return dict(bundle, lrc=preferred) if preferred else bundle
+
+
+def _cached_bundle(key: str, clean_words: bool) -> dict | None:
+    store = _LYRICS_STORE
+    if store is None:
+        return None
+    try:
+        cached = store.get(key)
+    except Exception as e:
+        log.debug(f"{PLUGIN_NAME}: lyrics cache read failed: {e}")
+        return None
+    return _with_lrc_style(cached, clean_words) if cached else None
+
+
+def _store_bundle(key: str, bundle: dict, ttl: float | None = None) -> None:
+    store = _LYRICS_STORE
+    if store is None:
+        return
+    try:
+        store.put(key, bundle, ttl=ttl)
+    except Exception as e:
+        log.debug(f"{PLUGIN_NAME}: lyrics cache write failed: {e}")
+
+
 def _find_best_bundle(
     title: str,
     artist: str,
     album_name: str,
-    length: int,
+    length: int | float,
     isrc: str,
     source_pref: str,
     clean_words: bool,
     tolerance: int,
     prefer_synced: bool,
+    provider_options: dict | None = None,
 ) -> dict | None:
     """Worker-thread body: query providers, pick the best match, resolve lyrics.
 
     Pure network work only - never touches Qt/Picard objects, so it is safe to
-    run off the GUI thread.
+    run off the GUI thread.  ``provider_options`` is the GUI-thread snapshot
+    from :func:`_provider_options`.
     """
     target = {
         "title": title,
@@ -1931,13 +1761,12 @@ def _find_best_bundle(
         "duration": length,
         "isrc": isrc,
     }
-    cache_key = track_key(target) if _LYRICS_STORE is not None else None
-    if cache_key:
-        try:
-            cached = _LYRICS_STORE.get(cache_key)
-        except Exception as e:
-            log.debug(f"{PLUGIN_NAME}: lyrics cache read failed: {e}")
-            cached = None
+    if _LYRICS_STORE is not None:
+        cached = _cached_bundle(_manual_cache_key(target), clean_words)
+        if cached:
+            log.info(f"{PLUGIN_NAME}: Automatic lookup: using your earlier manual choice")
+            return cached
+        cached = _cached_bundle(_auto_cache_key(target, source_pref), clean_words)
         if cached:
             log.info(f"{PLUGIN_NAME}: Automatic lookup: cached lyrics bundle available")
             return cached
@@ -1952,6 +1781,7 @@ def _find_best_bundle(
             source_preference=source_pref,
             duration_tolerance=tolerance,
             prefer_synced=prefer_synced,
+            provider_options=provider_options,
         )
     except Exception as e:
         log.warning(f"{PLUGIN_NAME}: search failed for \"{title}\": {type(e).__name__}")
@@ -1968,14 +1798,14 @@ def _find_best_bundle(
         reason = candidate.get("match_reason", assessment["reason"])
         eligible += bool(accepted)
         provider = candidate.get("provider_id")
-        if provider not in ("lrcred", "unison", "lyricsplus", "boidu", "lrclib"):
+        if provider not in PROVIDER_IDS:
             provider = "legacy/unknown"
         log.info(
             f"{PLUGIN_NAME}: Candidate {index} ({provider}) for \"{title}\" decision: "
             f"{'eligible' if accepted else 'rejected'}; reason={reason}"
         )
     log.info(f"{PLUGIN_NAME}: Automatic lookup: {len(candidates)} candidate(s), {eligible} eligible")
-    identity_group = choose_identity_group(candidates= candidates, target=target, tolerance=tolerance)
+    identity_group = choose_identity_group(candidates=candidates, target=target, tolerance=tolerance)
     if not identity_group:
         log.warning(f"{PLUGIN_NAME}: ambiguous or unverified lyrics matches for \"{title}\"")
         return None
@@ -1984,13 +1814,12 @@ def _find_best_bundle(
         f"{len(identity_group)} candidate(s); reason={identity_group[0].get('match_reason')}"
     )
 
-    # A high-scoring result is not useful if its lyrics endpoint is empty or
-    # unavailable.  Try the next compatible candidate instead of failing the
-    # whole track on the first provider result.
-    for candidate in identity_group:
-        if not _candidate_is_compatible(title, artist, length, isrc, candidate, tolerance):
-            log.info(f"{PLUGIN_NAME}: Candidate skipped: incompatible recording")
-            continue
+    # Every group member is the same recording, so the timing quality decides
+    # the order.  An empty or failing lyrics endpoint falls through to the next
+    # member, and plain text is kept only as a fallback when synced is preferred.
+    ordered = sorted(identity_group, key=_timing_rank) if prefer_synced else identity_group
+    fallback = None
+    for candidate in ordered:
         try:
             bundle = resolve_lyrics_bundle(candidate, clean_words=clean_words)
         except Exception as e:
@@ -2000,16 +1829,21 @@ def _find_best_bundle(
             )
             continue
 
-        if bundle.get("ttml") or bundle.get("lrc"):
-            log.info(f"{PLUGIN_NAME}: Candidate resolved: usable lyrics bundle")
-            if cache_key:
-                try:
-                    _LYRICS_STORE.put(cache_key, bundle)
-                except Exception as e:
-                    log.debug(f"{PLUGIN_NAME}: lyrics cache write failed: {e}")
-            return bundle
-        log.info(f"{PLUGIN_NAME}: Candidate skipped: empty lyrics bundle")
+        if not (bundle.get("ttml") or bundle.get("lrc")):
+            log.info(f"{PLUGIN_NAME}: Candidate skipped: empty lyrics bundle")
+            continue
+        if prefer_synced and bundle.get("quality") == "plain":
+            log.info(f"{PLUGIN_NAME}: Candidate has unsynchronized lyrics; looking for synced lyrics")
+            fallback = fallback or bundle
+            continue
+        log.info(f"{PLUGIN_NAME}: Candidate resolved: usable lyrics bundle")
+        _store_bundle(_auto_cache_key(target, source_pref), bundle)
+        return bundle
 
+    if fallback is not None:
+        log.info(f"{PLUGIN_NAME}: Using unsynchronized lyrics for \"{title}\"; no synced lyrics found")
+        _store_bundle(_auto_cache_key(target, source_pref), fallback)
+        return fallback
     log.warning(f"{PLUGIN_NAME}: no compatible lyrics candidate resolved for \"{title}\"")
     return None
 
@@ -2052,19 +1886,74 @@ def _apply_auto_bundle(method: str, title: str, files, track, bundle: dict | Non
                     files_processing.pop(file, None)
 
 
+def _manual_search(title, artist, album_name, isrc, length, track, files, interactive) -> bool:
+    """Interactive flow: the modal dialogs run on the GUI thread, network work does not."""
+    log.info(f"{PLUGIN_NAME}: Searching lyrics for \"{title}\" by \"{artist}\" ({format_duration(length)})")
+    parent_win = QtWidgets.QApplication.activeWindow()
+    clean_words = bool(config["betterlyrics_clean_word_timestamps"])
+    search = partial(
+        query_all_sources,
+        title=title,
+        artist=artist,
+        album=album_name,
+        duration=length,
+        isrc=isrc,
+        source_preference=config["betterlyrics_source"],
+        duration_tolerance=_config_int(get_plugin_api(), "betterlyrics_duration_tolerance", 5),
+        prefer_synced=bool(config["betterlyrics_prefer_synced"]),
+        provider_options=_provider_options(),
+    )
+    try:
+        candidates = run_with_busy_dialog(parent_win, "Searching lyrics providers…", search)
+    except Exception as error:
+        log.error(f"{PLUGIN_NAME}: lyrics search failed: {type(error).__name__}: {error}")
+        candidates = []
+    if candidates is None:
+        return False
+
+    selected_candidate = show_search_dialog(
+        parent_win, title, artist, album_name, length, isrc, candidates
+    )
+    if not selected_candidate:
+        log.info(f"{PLUGIN_NAME}: User cancelled lyrics selection")
+        return False
+
+    resolve = partial(resolve_lyrics_bundle, selected_candidate, clean_words=clean_words)
+    try:
+        bundle = run_with_busy_dialog(parent_win, "Downloading lyrics…", resolve)
+    except Exception as error:
+        log.error(f"{PLUGIN_NAME}: lyrics download failed: {type(error).__name__}: {error}")
+        bundle = {}
+    if bundle is None:
+        return False
+    if not bundle.get("ttml") and not bundle.get("lrc"):
+        log.warning(f"{PLUGIN_NAME}: Empty lyrics received for \"{title}\"")
+        QtWidgets.QMessageBox.information(
+            parent_win, PLUGIN_NAME, f"The selected result has no usable lyrics for \"{title}\"."
+        )
+        return False
+
+    # Later automatic lookups of this recording reuse the user's choice.
+    target = {"title": title, "artist": artist, "album": album_name, "duration": length, "isrc": isrc}
+    _store_bundle(_manual_cache_key(target), bundle, ttl=MANUAL_CHOICE_TTL)
+    save_lyrics_to_files(files, bundle, track=track, interactive=interactive)
+    return True
+
+
 def fetch_and_apply_lyrics(
     method: str,
     track: Track | None,
     files: list[File],
     metadata: Metadata,
     interactive: bool = False,
-):
+) -> bool:
     """Main entry point for finding, scoring, and saving TTML/LRC lyrics.
 
-    ``method == "search"`` runs synchronously on the GUI thread (it drives a
-    modal dialog). All automatic paths (``"get"``/``"load"``/``"save"``) are
-    handed to the background :class:`FetchQueue`, keeping the UI responsive and
-    pacing outbound requests.
+    ``method == "search"`` drives modal dialogs on the GUI thread while its
+    network requests run on a helper thread.  All automatic paths
+    (``"get"``/``"load"``/``"save"``) are handed to the background
+    :class:`FetchQueue`, keeping the UI responsive and pacing requests.
+    Returns whether lyrics were applied (search) or a job was queued.
     """
     title, artist, album_name, isrc, length = _extract_track_query(metadata, track)
 
@@ -2078,32 +1967,7 @@ def fetch_and_apply_lyrics(
             return False
 
     if method == "search":
-        # Interactive flow: the modal dialog must run on the GUI thread.
-        log.info(f"{PLUGIN_NAME}: Searching lyrics for \"{title}\" by \"{artist}\" ({format_duration(length)})")
-        candidates = query_all_sources(
-            title=title,
-            artist=artist,
-            album=album_name,
-            duration=length,
-            isrc=isrc,
-            source_preference=config["betterlyrics_source"],
-            duration_tolerance=int(config["betterlyrics_duration_tolerance"]),
-            prefer_synced=bool(config["betterlyrics_prefer_synced"]),
-        )
-        parent_win = QtWidgets.QApplication.activeWindow()
-        selected_candidate = show_search_dialog(
-            parent_win, title, artist, album_name, length, isrc, candidates
-        )
-        if not selected_candidate:
-            log.info(f"{PLUGIN_NAME}: User cancelled lyrics selection")
-            return
-
-        bundle = resolve_lyrics_bundle(selected_candidate)
-        if not bundle.get("ttml") and not bundle.get("lrc"):
-            log.warning(f"{PLUGIN_NAME}: Empty lyrics received for \"{title}\"")
-            return
-        save_lyrics_to_files(files, bundle, track=track, interactive=interactive)
-        return True
+        return _manual_search(title, artist, album_name, isrc, length, track, files, interactive)
 
     # Automatic flow: enqueue on the background fetch queue (never blocks the UI).
     if not _has_writable_lyrics_destination(files, track):
@@ -2113,9 +1977,10 @@ def fetch_and_apply_lyrics(
         )
         return False
     _ensure_queue_ready()
+    # Snapshot every setting here: workers must not read Picard's config.
     source_pref = config["betterlyrics_source"]
     clean_words = bool(config["betterlyrics_clean_word_timestamps"])
-    tolerance = int(config["betterlyrics_duration_tolerance"])
+    tolerance = _config_int(get_plugin_api(), "betterlyrics_duration_tolerance", 5)
     prefer_synced = bool(config["betterlyrics_prefer_synced"])
 
     submitted = FETCH_QUEUE.submit(
@@ -2130,6 +1995,7 @@ def fetch_and_apply_lyrics(
             clean_words,
             tolerance,
             prefer_synced,
+            _provider_options(),
         ),
         apply_fn=partial(_apply_auto_bundle, method, title, files, track),
         key=_dedup_key(track, files, method),
@@ -2176,6 +2042,7 @@ def on_file_saved(api, file=None) -> None:
     if file is None:  # called as (file,)
         api, file = None, api
 
+    _move_sidecars_with_file(file)
     state = files_processing.get(file)
     if state is not None:
         if state == "saving":
@@ -2272,8 +2139,31 @@ class BetterLyricsSearchAction(BaseAction):
 # ---------------------------------------------------------------------------
 # Orphaned .lrc / .ttml Files Cleaner
 # ---------------------------------------------------------------------------
+def find_orphaned_lyrics_files(root_dir: str) -> list[str]:
+    """Return ``.ttml``/``.lrc`` sidecars under ``root_dir`` with no audio file of the same stem.
+
+    Audio extensions match case-insensitively, so ``Song.FLAC`` still owns
+    ``Song.lrc`` on case-sensitive file systems.
+    """
+    orphans = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        audio_stems = set()
+        lyric_files = []
+        for name in filenames:
+            stem, extension = os.path.splitext(name)
+            extension = extension.lower()
+            if extension in AUDIO_EXTENSIONS:
+                audio_stems.add(stem)
+            elif extension in (".lrc", ".ttml"):
+                lyric_files.append((stem, name))
+        orphans.extend(
+            os.path.join(dirpath, name) for stem, name in lyric_files if stem not in audio_stems
+        )
+    return orphans
+
+
 def clean_orphaned_lyrics_files():
-    """Recursively scans a user-selected folder and deletes .ttml/.lrc files without matching audio."""
+    """Lets the user pick a folder, then deletes orphaned sidecars after confirmation."""
     try:
         parent = QtWidgets.QApplication.activeWindow()
         root_dir = QtWidgets.QFileDialog.getExistingDirectory(
@@ -2286,26 +2176,33 @@ def clean_orphaned_lyrics_files():
         if not root_dir:
             return
 
-        orphaned_count = 0
-        for dirpath, _, filenames in os.walk(root_dir):
-            lyric_files = [f for f in filenames if f.lower().endswith((".lrc", ".ttml"))]
-            for lfile in lyric_files:
-                base_name = os.path.splitext(lfile)[0]
-                audio_exists = any(
-                    os.path.exists(os.path.join(dirpath, base_name + ext))
-                    for ext in AUDIO_EXTENSIONS
-                )
-                if not audio_exists:
-                    try:
-                        os.remove(os.path.join(dirpath, lfile))
-                        orphaned_count += 1
-                    except Exception as e:
-                        log.error(f"{PLUGIN_NAME}: Failed to remove orphaned {lfile}: {e}")
+        orphans = find_orphaned_lyrics_files(root_dir)
+        if not orphans:
+            QtWidgets.QMessageBox.information(parent, "Cleanup Complete", "No orphaned lyrics files found.")
+            return
+        examples = "\n".join(os.path.relpath(path, root_dir) for path in orphans[:10])
+        if len(orphans) > 10:
+            examples += f"\n… and {len(orphans) - 10} more"
+        if not confirm_replace(
+            parent,
+            "Delete orphaned lyrics files?",
+            f"Found {len(orphans)} .ttml / .lrc file(s) without a matching audio file:\n\n"
+            f"{examples}\n\nDelete them permanently?",
+        ):
+            return
+
+        removed = 0
+        for path in orphans:
+            try:
+                os.remove(path)
+                removed += 1
+            except OSError as e:
+                log.error(f"{PLUGIN_NAME}: Failed to remove orphaned {path}: {e}")
 
         QtWidgets.QMessageBox.information(
             parent,
             "Cleanup Complete",
-            f"Removed {orphaned_count} orphaned lyrics file{'s' if orphaned_count != 1 else ''}.",
+            f"Removed {removed} orphaned lyrics file{'s' if removed != 1 else ''}.",
         )
     except Exception as err:
         log.error(f"{PLUGIN_NAME}: Error during orphaned file cleanup: {err}", exc_info=True)
@@ -2326,7 +2223,8 @@ class BetterLyricsOptionsPage(OptionsPage):
         # Description Header
         header = QtWidgets.QLabel(
             "<b>Better Lyrics for MusicBrainz Picard</b><br/>"
-            "Fetches rich TTML (Timed Text Markup Language) and LRC lyrics from LRC.red and Unison.<br/>"
+            "Fetches rich TTML (Timed Text Markup Language) and LRC lyrics from LRC.red, Unison, "
+            "LyricsPlus, Better Lyrics / Boidu and LRCLIB.<br/>"
             "<a href='https://github.com/better-lyrics/better-lyrics'>Better Lyrics Project</a> | "
             "<a href='https://unison.betterlyrics.org'>Unison Database</a>",
             self
@@ -2375,7 +2273,9 @@ class BetterLyricsOptionsPage(OptionsPage):
 
         self.save_ttml = QtWidgets.QCheckBox("Save external .ttml sidecar file alongside audio files", self)
         self.save_lrc = QtWidgets.QCheckBox("Save external .lrc sidecar file alongside audio files", self)
-        self.plain_as_txt = QtWidgets.QCheckBox("Save plain unsynchronized lyrics as .txt", self)
+        self.plain_as_txt = QtWidgets.QCheckBox(
+            "Save unsynchronized lyrics as a .txt sidecar (they never go into .ttml / .lrc)", self
+        )
 
         storage_layout.addWidget(self.embed_lyrics)
         storage_layout.addWidget(self.embed_ttml_tag)
@@ -2403,7 +2303,7 @@ class BetterLyricsOptionsPage(OptionsPage):
         src_h = QtWidgets.QHBoxLayout()
         src_label = QtWidgets.QLabel("Primary Source:", self)
         self.source_combo = QtWidgets.QComboBox(self)
-        self.source_combo.addItem("All Sources (Smart Hybrid: LRC.red + Unison)", "all")
+        self.source_combo.addItem("All enabled sources (best verified match)", "all")
         self.source_combo.addItem("LRC.red (Better Lyrics Primary)", "lrcred")
         self.source_combo.addItem("Unison (Crowdsourced Community)", "unison")
         self.source_combo.addItem("LyricsPlus (KPOE / Apple-compatible)", "lyricsplus")
@@ -2454,13 +2354,13 @@ class BetterLyricsOptionsPage(OptionsPage):
         perf_layout.addLayout(workers_h)
 
         rate_h = QtWidgets.QHBoxLayout()
-        rate_label = QtWidgets.QLabel("Minimum delay between requests (ms):", self)
+        rate_label = QtWidgets.QLabel("Minimum delay between requests to a service (ms):", self)
         self.rate_spin = QtWidgets.QSpinBox(self)
         self.rate_spin.setRange(0, 5000)
         self.rate_spin.setSingleStep(50)
         self.rate_spin.setValue(200)
         self.rate_spin.setToolTip(
-            "Minimum spacing between outbound HTTP requests across all workers.\n"
+            "Minimum spacing between HTTP requests to the same service, across all workers.\n"
             "Prevents API abuse and rate-limit (HTTP 429) responses. 0 disables pacing."
         )
         rate_h.addWidget(rate_label)
@@ -2474,6 +2374,7 @@ class BetterLyricsOptionsPage(OptionsPage):
         api_label = QtWidgets.QLabel("Better Lyrics API Key (Optional):", self)
         self.api_key_input = QtWidgets.QLineEdit(self)
         self.api_key_input.setPlaceholderText("Optional API key for api.betterlyrics.org")
+        self.api_key_input.setEchoMode(QtWidgets.QLineEdit.EchoMode.PasswordEchoOnEdit)
         api_h.addWidget(api_label)
         api_h.addWidget(self.api_key_input)
         adv_layout.addLayout(api_h)
@@ -2519,10 +2420,11 @@ class BetterLyricsOptionsPage(OptionsPage):
         self.enable_boidu.setChecked(bool(cfg.get("betterlyrics_enable_boidu", True)))
         self.enable_lrclib.setChecked(bool(cfg.get("betterlyrics_enable_lrclib", True)))
 
-        self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 5)))
-        self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "")))
-        self.workers_spin.setValue(int(cfg.get("betterlyrics_max_workers", 3)))
-        self.rate_spin.setValue(int(cfg.get("betterlyrics_rate_limit_ms", 200)))
+        api = get_plugin_api()
+        self.duration_spin.setValue(_config_int(api, "betterlyrics_duration_tolerance", 5))
+        self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "") or ""))
+        self.workers_spin.setValue(_config_int(api, "betterlyrics_max_workers", 3))
+        self.rate_spin.setValue(_config_int(api, "betterlyrics_rate_limit_ms", 200))
 
     def save(self):
         # ``config`` writes through to api.plugin_config (persisted) and the
@@ -2557,14 +2459,14 @@ class BetterLyricsOptionsPage(OptionsPage):
         cfg["betterlyrics_max_workers"] = self.workers_spin.value()
         cfg["betterlyrics_rate_limit_ms"] = self.rate_spin.value()
 
-        # Apply the request pacer immediately; worker count applies on next reload.
+        # Apply the request pacing and worker count immediately.
         try:
-            if _RATE_LIMITER is not None:
-                _RATE_LIMITER.set_interval(self.rate_spin.value() / 1000.0)
+            if _PROVIDER_HTTP is not None:
+                _PROVIDER_HTTP.min_interval = self.rate_spin.value() / 1000.0
             if FETCH_QUEUE is not None:
                 FETCH_QUEUE.configure(self.workers_spin.value())
-        except Exception:
-            pass
+        except Exception as error:
+            log.warning(f"{PLUGIN_NAME}: could not apply queue settings: {type(error).__name__}")
 
 
 # ---------------------------------------------------------------------------
@@ -2589,14 +2491,22 @@ def enable(api: PluginApi) -> None:
     for key, default in PLUGIN_OPTIONS.items():
         api.plugin_config.register_option(key, default)
 
-    # Prepare the stability layer: caches, request pacer and background queue.
+    # Prepare the stability layer: HTTP client, persistent cache and queue.
+    # A repeated enable without disable must not leak the previous instances.
     _init_caches()
-    _RATE_LIMITER.set_interval(_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0)
+    if _PROVIDER_HTTP is not None:
+        _PROVIDER_HTTP.close()
+    if _LYRICS_STORE is not None:
+        try:
+            _LYRICS_STORE.close()
+        except Exception:
+            pass
     _PROVIDER_HTTP = HttpClient(
         timeout=12.0,
         retries=2,
         min_interval=_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0,
-        ssl_context=_get_ssl_context(),
+        ssl_context=create_ssl_context(),
+        user_agent=USER_AGENT,
     )
     try:
         _LYRICS_STORE = LyricsStore(_lyrics_store_path())
@@ -2655,8 +2565,4 @@ def disable() -> None:
         _MAIN_INVOKER = None
     if FETCH_QUEUE is not None:
         FETCH_QUEUE.set_invoker(None)
-    if _HTTP_TEXT_CACHE is not None:
-        _HTTP_TEXT_CACHE.clear()
-    if _JSON_CACHE is not None:
-        _JSON_CACHE.clear()
     CURRENT_PLUGIN_API = None

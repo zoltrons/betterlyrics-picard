@@ -88,7 +88,7 @@ plugin = load_plugin()
 
 
 class MatchingTests(unittest.TestCase):
-    def test_explicit_weights_keep_exact_identity_at_one(self):
+    def test_exact_isrc_and_metadata_score_full_identity(self):
         item = {
             "title": "Song",
             "artist": "Artist",
@@ -96,38 +96,25 @@ class MatchingTests(unittest.TestCase):
             "duration": 180,
             "isrc": "US-RC1-23-00001",
         }
-        score = plugin.calculate_match_score(
-            "Song", "Artist", "Album", 180, "USRC12300001", item
-        )
-        self.assertEqual(score, 1.0)
+        target = {"title": "Song", "artist": "Artist", "album": "Album",
+                  "duration": 180, "isrc": "USRC12300001"}
+        result = plugin.assess_match(target, item, tolerance=5)
+        self.assertTrue(result["eligible"])
+        self.assertAlmostEqual(result["score"], 1.0)
 
     def test_missing_metadata_does_not_receive_a_false_bonus(self):
-        score = plugin.calculate_match_score(
-            "Song", "Artist", "", 0, "", {"title": "Song", "artist": "Artist"}
+        result = plugin.assess_match(
+            {"title": "Song", "artist": "Artist"}, {"title": "Song", "artist": "Artist"}
         )
-        self.assertAlmostEqual(score, 0.45)
+        self.assertAlmostEqual(result["score"], 0.43)
+        self.assertFalse(result["eligible"])
 
     def test_conflicting_isrc_and_duration_are_rejected(self):
-        item = {
-            "title": "Song",
-            "artist": "Artist",
-            "duration": 210,
-            "isrc": "USRC99999999",
-            "score": 1.0,
-        }
-        self.assertFalse(
-            plugin._candidate_is_compatible("Song", "Artist", 180, "USRC12300001", item, 5)
-        )
-
-    def test_provider_match_annotation_is_not_rejected_by_legacy_score_floor(self):
-        self.assertTrue(
-            plugin._candidate_is_compatible(
-                "Song", "Artist", 180, "", {
-                    "title": "Song", "artist": "Artist", "score": 0.43,
-                    "match_eligible": True, "match_reason": "provider_query_bound",
-                }, 5
-            )
-        )
+        target = {"title": "Song", "artist": "Artist", "duration": 180, "isrc": "USRC12300001"}
+        isrc = plugin.assess_match(target, {**target, "isrc": "USRC99999999"})
+        duration = plugin.assess_match(target, {**target, "isrc": "", "duration": 210})
+        self.assertEqual((isrc["eligible"], isrc["reason"]), (False, "isrc_conflict"))
+        self.assertEqual((duration["eligible"], duration["reason"]), (False, "duration_conflict"))
 
     def test_exact_isrc_allows_provider_version_suffix(self):
         candidate = {
