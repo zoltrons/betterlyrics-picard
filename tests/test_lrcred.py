@@ -2,11 +2,8 @@
 
 Network-free regression tests; Picard/Qt are stubbed by the existing harness.
 """
-import io
 import unittest
-from unittest.mock import MagicMock, Mock, call, patch
-from urllib.error import HTTPError, URLError
-from urllib.request import Request
+from unittest.mock import ANY, MagicMock, Mock, call, patch
 
 from test_matching import plugin
 
@@ -129,44 +126,57 @@ class SearchFlowTests(unittest.TestCase):
         search.assert_called_once_with(
             title="Title", artist="Artist", album="Album", duration=180,
             isrc=ISRC, query="edited search", source_preference="all",
+            duration_tolerance=5, prefer_synced=True, provider_options=ANY,
         )
 
 
 class HttpRetryTests(unittest.TestCase):
+    """fetch_json/fetch_text run through the shared, cancellable HttpClient."""
+
     def setUp(self):
-        # No real timers, network calls or queues in this test.
-        for name, value in (("_init_caches", Mock()), ("_RATE_LIMITER", Mock()), ("log", Mock())):
+        self.calls = []
+        self.responses = []
+
+        def transport(url, headers=None, timeout=None, cancel_event=None):
+            self.calls.append(url)
+            return self.responses.pop(0)
+
+        client = plugin.HttpClient(transport=transport, min_interval=0, retries=2, cache=False)
+        # Keep the retry backoff out of the test's wall-clock time.
+        client._sleep = lambda seconds: True
+        for name, value in (("_PROVIDER_HTTP", client), ("log", Mock())):
             patcher = patch.object(plugin, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = patch.object(plugin.time, "sleep")
-        self.sleep = patcher.start()
-        self.addCleanup(patcher.stop)
-        self.request = Request(f"{BASE}/s/{ISRC}.json")
 
     def test_permanent_http_errors_are_not_retried(self):
         for status in (400, 403, 404):
             with self.subTest(status=status):
-                body = io.BytesIO(b"not found")
-                error = HTTPError(self.request.full_url, status, "error", {}, body)
-                with patch.object(plugin, "_http_get", side_effect=error) as get:
-                    self.assertIsNone(plugin._http_get_with_retry(self.request, 10, retries=2))
-                get.assert_called_once()
-                self.assertTrue(body.closed)
-        self.sleep.assert_not_called()
+                self.calls.clear()
+                self.responses[:] = [(status, b"not found")]
+                self.assertIsNone(plugin.fetch_json(f"{BASE}/s/{ISRC}.json"))
+                self.assertEqual(len(self.calls), 1)
 
     def test_transient_http_and_network_errors_still_retry(self):
-        for error in (
-            HTTPError(self.request.full_url, 429, "rate limit", {}, io.BytesIO()),
-            HTTPError(self.request.full_url, 503, "unavailable", {}, io.BytesIO()),
-            URLError("temporary network error"),
-        ):
-            with self.subTest(error=error), patch.object(
-                plugin, "_http_get", side_effect=[error, (200, "ok")]
-            ) as get:
-                self.assertEqual(plugin._http_get_with_retry(self.request, 10, retries=2), "ok")
-                self.assertEqual(get.call_count, 2)
-        self.assertEqual(self.sleep.call_count, 3)
+        for failure in ((429, b""), (503, b""), OSError("temporary network error")):
+            with self.subTest(failure=failure):
+                self.calls.clear()
+                self.responses[:] = [failure, (200, b"ok")]
+                if isinstance(failure, Exception):
+                    def raise_then_succeed(url, headers=None, timeout=None, cancel_event=None):
+                        self.calls.append(url)
+                        if len(self.calls) == 1:
+                            raise failure
+                        return (200, b"ok")
+                    plugin._PROVIDER_HTTP.transport = raise_then_succeed
+                self.assertEqual(plugin.fetch_text(f"{BASE}/s/{ISRC}.lrc"), "ok")
+                self.assertEqual(len(self.calls), 2)
+
+    def test_disabled_plugin_makes_no_requests(self):
+        with patch.object(plugin, "_PROVIDER_HTTP", None):
+            self.assertIsNone(plugin.fetch_json(f"{BASE}/s/{ISRC}.json"))
+            self.assertIsNone(plugin.fetch_text(f"{BASE}/s/{ISRC}.lrc"))
+        self.assertEqual(self.calls, [])
 
 
 if __name__ == "__main__":

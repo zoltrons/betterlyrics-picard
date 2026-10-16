@@ -17,14 +17,15 @@ Designed for **MusicBrainz Picard 3.0+** using the modern **Plugin v3** architec
   - **LyricsPlus KPOE v2**: Apple-compatible word / syllable-timed lyrics.
   - **Better Lyrics API / Boidu**: Public Boidu cache-backed TTML fallback, with the protected Better Lyrics API available when a key is supplied.
   - **LRCLIB**: Line-synced fallback.
-- **Smart Match Scoring**: Ranks results with explicit identity weights (ISRC 35%, title 30%, artist 15%, album 5%, duration 15%), strict duration tolerance (default ±5s), and exact MusicBrainz ISRC matching. Empty metadata never receives a false bonus, and a failed lyrics endpoint falls back to the next compatible candidate.
-- **Background Fetch Queue**: Non-blocking worker pool fetches lyrics off the UI thread, so loading large albums never freezes Picard. Identical in-flight jobs are de-duplicated, transient failures (HTTP 429/5xx, network errors) are retried with exponential backoff, and successful responses are cached to reduce repeat lookups.
-- **Rate Limiting / Anti-Abuse**: A configurable minimum delay between outbound requests paces the whole queue, preventing burst traffic and API rate-limit (`429`) responses.
+- **Smart Match Scoring**: Accepts a result only when it passes explicit identity gates (exact ISRC, or strong title and artist evidence plus duration within the tolerance, default ±5s), then ranks by an identity score weighted towards ISRC (50%), title (25%) and artist (18%). Empty metadata never receives a false bonus, conflicting ISRCs, durations or versions are rejected, and a failed lyrics endpoint falls back to the next candidate for the same recording. When synchronized lyrics are preferred, word- and line-synced results are tried before plain text.
+- **Background Fetch Queue**: Non-blocking worker pool fetches lyrics off the UI thread, so loading large albums never freezes Picard. Identical in-flight jobs are de-duplicated, transient failures (HTTP 429/5xx, network errors) are retried with exponential backoff, `Retry-After` is honoured, and successful responses are cached to reduce repeat lookups. Disabling the plugin cancels in-flight requests and discards queued work without blocking Picard.
+- **Rate Limiting / Anti-Abuse**: A configurable minimum delay between requests to each service paces the whole queue, preventing burst traffic and API rate-limit (`429`) responses. Requests identify the plugin with an honest `User-Agent`, never follow redirects and cap response sizes.
 - **Loss-aware lyrics model**: Keeps native TTML, enhanced word-timed LRC, line LRC and plain text as separate representations; missing word end times are never fabricated.
-- **Persistent matching cache**: Stores successful bundles and manual provider choices in Picard's user-data directory, never inside the installed plugin or source repository.
-- **Interactive Search Dialog**: Right-click any track or album to search manually, view results in a detailed table (title, artist, album, duration, sync type, source), and inspect lyrics with side-by-side TTML/LRC preview before applying.
+- **Persistent matching cache**: Stores successful bundles in Picard's user-data directory, never inside the installed plugin or source repository. Lyrics you pick in the search dialog are remembered and reused by later automatic lookups of the same recording.
+- **Interactive Search Dialog**: Right-click any track or album to search manually, view results in a detailed table (title, artist, album, duration, sync type, source), and inspect lyrics with side-by-side TTML/LRC preview before applying. Searches and downloads run in the background behind a cancellable progress dialog, so Picard stays responsive.
 - **Automation Hooks**: Automatic search and retrieval when loading tracks into Picard or when saving files.
-- **Library Maintenance**: Built-in tool to scan your music directory and clean up orphaned `.ttml` and `.lrc` files whose audio counterparts have been removed.
+- **Sidecars follow your files**: When Picard renames or moves an audio file on save, the `.ttml`, `.lrc` and `.txt` sidecars this plugin wrote for it move along instead of being left behind.
+- **Library Maintenance**: Built-in tool to scan your music directory and clean up orphaned `.ttml` and `.lrc` files whose audio counterparts have been removed, after showing what it found and asking for confirmation.
 
 ---
 
@@ -74,13 +75,14 @@ Settings are available under **Options -> Plugins -> Better Lyrics**:
 | **Search when loading tracks** | `Enabled` | Automatically queries for lyrics when a track is added to Picard. |
 | **Search when saving files** | `Disabled` | Automatically queries for lyrics when saving files. |
 | **Auto overwrite existing lyrics** | `Disabled` | Overwrites existing tags and sidecars without prompting. |
-| **Primary Source** | `All Sources` | Select `All Sources (Smart Hybrid)`, `LRC.red`, or `Unison`. |
+| **Save unsynchronized lyrics as .txt** | `Disabled` | Writes plain (untimed) lyrics to a `.txt` sidecar. Plain lyrics are embedded as text in the `lyrics` tag and are never written as TTML or LRC. |
+| **Primary Source** | `All enabled sources` | Query every enabled provider, or only `LRC.red`, `Unison`, `LyricsPlus`, `Better Lyrics API / Boidu` or `LRCLIB`. |
 | **LyricsPlus word/syllable fallback** | `Enabled` | Enables the KPOE v2 LyricsPlus adapter. |
 | **Better Lyrics API / Boidu fallback** | `Enabled` | Uses Boidu's public cache endpoint without a key; add only your own authorized key when using the protected Better Lyrics API. |
 | **LRCLIB fallback** | `Enabled` | Enables the line-synced LRCLIB fallback. |
 | **Duration tolerance (seconds)** | `5` | Maximum allowable difference between audio track length and lyric duration. |
 | **Max parallel requests** | `3` | Number of background worker threads used to fetch lyrics concurrently (higher = faster, more bandwidth). |
-| **Minimum delay between requests (ms)** | `200` | Minimum spacing between outbound HTTP requests across all workers. Prevents API abuse and `429` rate-limiting (`0` disables pacing). |
+| **Minimum delay between requests to a service (ms)** | `200` | Minimum spacing between HTTP requests to the same service, across all workers. Prevents API abuse and `429` rate-limiting (`0` disables pacing). |
 | **Better Lyrics API Key** | *(empty)* | Optional authorized API key for `api.betterlyrics.org`; the keyless default uses `lyrics-api.boidu.dev`. |
 
 ---
@@ -129,8 +131,8 @@ Right-click any track or album in Picard's selection view:
 ### Developer checks
 
 ```bash
-python3.11 -m unittest discover -s tests -v
-python3.11 -m py_compile __init__.py tests/test_matching.py tests/test_lrcred.py
+python3 -m unittest discover -s tests -v
+python3 -m py_compile *.py tests/*.py
 ```
 
 The regression suite stubs Picard/Qt and HTTP responses. It does not replace
@@ -167,19 +169,19 @@ Python 3.14.7, PyQt 6.11.0 and Qt 6.11.2; a full application click-through remai
 a separate check.
 
 ### Orphaned File Cleaner
-Under **Options -> Plugins -> Better Lyrics**, click **Clean Orphaned .ttml / .lrc Files in Library...** and select your music root directory. The plugin will recursively delete any `.ttml` or `.lrc` sidecars that no longer correspond to an audio file.
+Under **Options -> Plugins -> Better Lyrics**, click **Clean Orphaned .ttml / .lrc Files in Library...** and select your music root directory. The plugin recursively looks for `.ttml` or `.lrc` sidecars that no longer correspond to an audio file (audio extensions match case-insensitively), lists them, and deletes them only after you confirm.
 
 ### Reliability & Performance
 Automatic lyric lookups run on a background worker queue instead of the UI thread, so Picard stays responsive while large libraries are processed. The queue:
 
 - **De-duplicates** identical in-flight jobs (adding the same track twice only fetches once).
-- **Paces requests** with a configurable minimum delay, avoiding burst traffic and API rate limits.
-- **Retries** transient failures (network errors, HTTP 408/425/429/5xx) with jittered exponential backoff.
+- **Paces requests** to each service with a configurable minimum delay, avoiding burst traffic and API rate limits.
+- **Retries** transient failures (network errors, HTTP 408/425/429/5xx) with exponential backoff, honouring `Retry-After`.
 - **Caches** successful responses (and briefly caches failures) to reduce repeat lookups.
 
 While work is outstanding, the number of tracks still waiting is shown in Picard's status bar (e.g. *Better Lyrics: 7 track(s) in lyrics queue...*), so you can see at a glance how much is left.
 
-Tune these under **Options -> Plugins -> Better Lyrics -> Sources & Advanced Settings -> Performance & Stability**. The request delay applies immediately; the worker count takes effect after reloading the plugin or restarting Picard.
+Tune these under **Options -> Plugins -> Better Lyrics -> Sources & Advanced Settings -> Performance & Stability**. Both the request delay and the worker count apply as soon as you save the options.
 
 ---
 
