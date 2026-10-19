@@ -933,14 +933,46 @@ def _clear_status_message() -> None:
             pass
 
 
+def _qt_application():
+    """Returns the QApplication, or ``None`` in CLI/tests without a GUI."""
+    try:
+        return QtWidgets.QApplication.instance()
+    except Exception:
+        return None
+
+
+def _qt_dispatch_available() -> bool:
+    """Whether this Qt build exposes the APIs used for cross-thread dispatch."""
+    return (
+        hasattr(QtCore, "QObject")
+        and hasattr(QtCore, "QMetaObject")
+        and hasattr(QtCore, "pyqtSlot")
+        and hasattr(getattr(QtCore, "Qt", None), "ConnectionType")
+    )
+
+
+def _gui_slot():
+    """``@pyqtSlot()`` when available; a no-op decorator for test stubs."""
+    if hasattr(QtCore, "pyqtSlot"):
+        return QtCore.pyqtSlot()
+    return lambda fn: fn
+
+
+_RETIRED_INVOKERS: list = []
+
+
 class MainThreadDispatcher(QtCore.QObject):
     """Delivers worker results to the GUI thread and mirrors queue progress.
 
-    Instead of marshalling results through cross-thread Qt signals, worker
-    threads push plain callables onto a thread-safe queue which a ``QTimer``
-    drains on the GUI thread.  This is robust regardless of how the worker
-    threads are created, and the same timer keeps Picard's status bar updated
-    with the number of tracks still waiting in the lyrics queue.
+    Worker threads push plain callables onto a thread-safe queue.  A QTimer
+    drains them on the GUI thread and keeps Picard's status bar updated.
+
+    Picard enables plugins on a QThreadPool worker during install and update, so
+    the dispatcher may be constructed outside the GUI thread.  A QTimer created
+    there belongs to a thread without an event loop and never fires, which made
+    automatic lyrics appear broken until the plugin was toggled.  The object is
+    therefore moved to the QApplication's thread first, and timer start-up is
+    marshalled with a queued ``QMetaObject.invokeMethod`` call.
     """
 
     def __init__(self, poll_ms: int = 100, max_callbacks_per_tick: int = 25):
@@ -949,33 +981,56 @@ class MainThreadDispatcher(QtCore.QObject):
         self._post_lock = threading.Lock()
         self._stopped = False
         self._last_status: str | None = None
+        self._poll_ms = max(20, int(poll_ms))
         self._max_callbacks_per_tick = max(1, int(max_callbacks_per_tick))
         self._timer = None
-        try:
-            self._timer = QtCore.QTimer(self)
-            self._timer.setInterval(max(20, int(poll_ms)))
-            self._timer.timeout.connect(self.poll)
-            self._timer.start()
-        except Exception as e:
-            log.warning(f"{PLUGIN_NAME}: progress timer unavailable: {e}")
+        self._cleaned = False
 
-    def post(self, fn) -> None:
-        """Queues a callable to run on the GUI thread (thread-safe)."""
-        with self._post_lock:
-            if not self._stopped:
-                self._callbacks.put(fn)
-
-    def stop(self) -> None:
-        """Stops the timer, drops pending results and clears the status line."""
-        with self._post_lock:
-            if self._stopped:
+        app = _qt_application()
+        if app is not None and _qt_dispatch_available():
+            try:
+                self.moveToThread(app.thread())
+                # PyQt returns None here even on success; an exception is the
+                # only failure signal.
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_start_timer",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                )
                 return
-            self._stopped = True
-            while True:
-                try:
-                    self._callbacks.get_nowait()
-                except queue.Empty:
-                    break
+            except Exception as error:
+                log.warning(f"{PLUGIN_NAME}: progress timer unavailable: {error}")
+        # No QApplication (CLI/tests): callers drive poll() directly.
+
+    @_gui_slot()
+    def _start_timer(self) -> None:
+        """Creates the repeating timer on the dispatcher's GUI thread."""
+        if self._stopped:
+            self._cleanup_after_stop()
+            return
+        if not _qt_dispatch_available() or self._timer is not None:
+            return
+        try:
+            timer = QtCore.QTimer(self)
+            timer.setInterval(self._poll_ms)
+            timer.timeout.connect(self._tick)
+            timer.start()
+            self._timer = timer
+            self._tick()
+        except Exception as error:
+            log.warning(f"{PLUGIN_NAME}: progress timer unavailable: {error}")
+
+    @_gui_slot()
+    def _cleanup_after_stop(self) -> None:
+        """Releases the timer and status line on the GUI thread exactly once.
+
+        A dispatcher may be disabled from Picard's install/update worker.  Its
+        QObject must still be destroyed on the GUI thread, so ``stop()`` retires
+        it and this queued slot performs the actual Qt cleanup.
+        """
+        if self._cleaned:
+            return
+        self._cleaned = True
         timer = self._timer
         self._timer = None
         if timer is not None:
@@ -987,12 +1042,66 @@ class MainThreadDispatcher(QtCore.QObject):
                 timer.deleteLater()
             except Exception:
                 pass
+        if self._last_status is not None:
+            self._last_status = None
+            # Do not clear a message owned by a newer dispatcher created by an
+            # immediate disable → re-enable cycle.
+            if _MAIN_INVOKER is self or _MAIN_INVOKER is None:
+                try:
+                    _clear_status_message()
+                except Exception:
+                    pass
         try:
-            if self._last_status is not None:
-                _clear_status_message()
+            if self in _RETIRED_INVOKERS:
+                _RETIRED_INVOKERS.remove(self)
+        except ValueError:
+            pass
+        try:
+            self.deleteLater()
         except Exception:
             pass
-        self._last_status = None
+
+    def _tick(self) -> None:
+        if self._stopped:
+            self._cleanup_after_stop()
+            return
+        self.poll()
+
+    def post(self, fn) -> None:
+        """Queues a callable to run on the GUI thread (thread-safe)."""
+        with self._post_lock:
+            if not self._stopped:
+                self._callbacks.put(fn)
+
+    def stop(self) -> None:
+        """Drops pending results; the GUI tick performs Qt cleanup.
+
+        ``stop`` can be called from Picard's install/update worker, so it must
+        not stop or delete the QTimer directly.  The next GUI tick notices
+        ``_stopped`` and releases the timer and status line on the GUI thread.
+        """
+        with self._post_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            while True:
+                try:
+                    self._callbacks.get_nowait()
+                except queue.Empty:
+                    break
+        # Keep the QObject alive until the GUI thread destroys it.  Dropping the
+        # last Python reference in an install/update worker could otherwise run
+        # the Qt destructor from the wrong thread.
+        if _qt_application() is not None and _qt_dispatch_available():
+            _RETIRED_INVOKERS.append(self)
+            try:
+                QtCore.QMetaObject.invokeMethod(
+                    self,
+                    "_cleanup_after_stop",
+                    QtCore.Qt.ConnectionType.QueuedConnection,
+                )
+            except Exception:
+                pass
 
     def poll(self) -> None:
         """Runs a bounded batch of pending callbacks, then refreshes status.
@@ -1002,7 +1111,7 @@ class MainThreadDispatcher(QtCore.QObject):
         are applied on subsequent ticks.
         """
         handled = 0
-        while handled < self._max_callbacks_per_tick:
+        while handled < self._max_callbacks_per_tick and not self._stopped:
             try:
                 fn = self._callbacks.get_nowait()
             except queue.Empty:

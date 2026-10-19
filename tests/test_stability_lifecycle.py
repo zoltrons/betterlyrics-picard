@@ -249,6 +249,40 @@ class ProviderAndThreadingTests(unittest.TestCase):
 
 
 class GuiDispatchTests(unittest.TestCase):
+    def test_timer_start_is_marshalled_to_the_gui_thread(self):
+        """Install/update enables plugins on a worker thread.
+
+        A QTimer created there would belong to a thread without an event loop
+        and never fire.  The dispatcher must move itself to the application's
+        thread and start its timer through a queued invocation.  This is the
+        regression that made automatic lyrics stop working until the plugin was
+        toggled.
+        """
+        application = SimpleNamespace(thread=lambda: "gui-thread")
+        invocations = []
+        move = Mock()
+
+        fake_meta = SimpleNamespace(
+            invokeMethod=lambda *args: invocations.append(args) or True
+        )
+        fake_connection = SimpleNamespace(QueuedConnection="queued")
+
+        with patch.object(plugin, "_qt_application", return_value=application), \
+                patch.object(plugin, "_qt_dispatch_available", return_value=True), \
+                patch.object(plugin.QtCore, "QMetaObject", fake_meta, create=True), \
+                patch.object(plugin.QtCore, "Qt", SimpleNamespace(ConnectionType=fake_connection), create=True), \
+                patch.object(plugin.QtCore.QObject, "moveToThread", move, create=True), \
+                patch.object(plugin, "log", Mock()):
+            dispatcher = plugin.MainThreadDispatcher(poll_ms=10, max_callbacks_per_tick=5)
+
+        move.assert_called_once_with("gui-thread")
+        self.assertEqual(len(invocations), 1)
+        self.assertIs(invocations[0][0], dispatcher)
+        self.assertEqual(invocations[0][1], "_start_timer")
+        self.assertEqual(invocations[0][2], "queued")
+        # Nothing is created before the queued GUI call actually runs.
+        self.assertIsNone(dispatcher._timer)
+
     def test_callback_drain_is_bounded_per_tick(self):
         with patch.object(plugin, "log", Mock()):
             dispatcher = plugin.MainThreadDispatcher(poll_ms=1000, max_callbacks_per_tick=5)
