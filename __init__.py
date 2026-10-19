@@ -148,6 +148,23 @@ AUDIO_EXTENSIONS = {
 # Global reference to PluginApi instance
 CURRENT_PLUGIN_API: PluginApi | None = None
 
+# Picard calls ``disable()`` before its automatic registration cleanup.  These
+# flags make our own asynchronous hooks inert immediately, so a late processor
+# callback cannot restart the worker pool or touch a closed client after the
+# plugin has been disabled.  ``_DISABLED`` starts as False to keep the module
+# usable from direct tests and smoke scripts that never call ``enable()``.
+_ENABLED = False
+_DISABLED = False
+
+# Set on disable, cleared on enable.  Background HTTP work observes it between
+# attempts and during backoff so shutdown does not wait for a retry to expire.
+_SHUTDOWN_EVENT = threading.Event()
+
+
+def is_plugin_disabled() -> bool:
+    """Return whether Picard disabled the plugin and background work must stop."""
+    return _DISABLED
+
 
 def get_plugin_api() -> PluginApi | None:
     """Retrieves the active PluginApi instance."""
@@ -241,19 +258,40 @@ def _config_int(api: PluginApi | None, key: str, default: int) -> int:
         return default
 
 
-def _ensure_queue_ready() -> None:
+def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    """Coerces a possibly corrupt stored option into a usable widget value.
+
+    Picard's docs recommend bounded numeric options because a hand-edited or
+    legacy config can contain an out-of-range value.  The options page must load
+    instead of raising in that case.
+    """
+    try:
+        number = int(value)
+    except (TypeError, ValueError, OverflowError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
+def _ensure_queue_ready() -> bool:
     """Lazily (idempotently) starts the background fetch queue.
 
     Called from the GUI thread on the automatic paths, guaranteeing that a
     submitted job always has workers and a main-thread invoker available.
+    Returns ``False`` once Picard has disabled the plugin: processors may still
+    deliver a queued callback, and resurrecting the pool then would start
+    network work behind a disabled plugin.
     """
     global _MAIN_INVOKER
+    if is_plugin_disabled():
+        log.debug(f"{PLUGIN_NAME}: background queue not started (plugin disabled)")
+        return False
     _init_caches()
     if _MAIN_INVOKER is None:
         _MAIN_INVOKER = MainThreadDispatcher()
     FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
     if not FETCH_QUEUE.is_running:
         FETCH_QUEUE.start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -331,21 +369,48 @@ def truncate_text(text: str, max_lines: int = 6, max_chars_per_line: int = 55) -
 # TTML & LRC Format Handlers
 # ---------------------------------------------------------------------------
 def parse_ttml_time(time_str: str) -> tuple[int, float]:
-    """Parses TTML timestamp format (mm:ss.xxx, hh:mm:ss.xxx, or xxx.xxxs) into (minutes, seconds)."""
-    clean_str = time_str.strip().rstrip("s")
-    parts = clean_str.split(":")
+    """Parses a TTML timestamp into ``(minutes, seconds)``.
+
+    Supported forms are clock time (``mm:ss.mmm`` / ``hh:mm:ss.mmm``), offset
+    time with an explicit unit (``1.5s``, ``1500ms``) and a bare seconds value.
+    Decimal commas are accepted because some TTML producers emit them.  Invalid
+    values raise ``ValueError``; callers decide whether one bad line may be
+    skipped instead of failing the whole document.
+    """
+    if time_str is None:
+        raise ValueError("empty timestamp")
+    clean_str = str(time_str).strip()
+    if not clean_str:
+        raise ValueError("empty timestamp")
+    lowered = clean_str.casefold()
+
+    if lowered.endswith("ms"):
+        total_seconds = float(lowered[:-2].replace(",", ".")) / 1000.0
+        if total_seconds < 0:
+            raise ValueError("negative timestamp")
+        return int(total_seconds // 60), total_seconds % 60
+    if lowered.endswith("s"):
+        lowered = lowered[:-1]
+
+    parts = lowered.split(":")
+    if len(parts) == 1:
+        total_seconds = float(parts[0].replace(",", "."))
+        if total_seconds < 0:
+            raise ValueError("negative timestamp")
+        return int(total_seconds // 60), total_seconds % 60
+
+    if len(parts) not in (2, 3):
+        raise ValueError(f"unsupported timestamp: {time_str!r}")
+    seconds_value = float(parts[-1].replace(",", "."))
+    if seconds_value < 0:
+        raise ValueError("negative timestamp")
     if len(parts) == 2:
-        mm = int(parts[0])
-        ss = float(parts[1])
-    elif len(parts) == 3:
-        hh = int(parts[0])
-        mm = int(parts[1]) + hh * 60
-        ss = float(parts[2])
+        minutes = int(parts[0])
     else:
-        sec_val = float(clean_str)
-        mm = int(sec_val // 60)
-        ss = sec_val % 60
-    return mm, ss
+        minutes = int(parts[0]) * 60 + int(parts[1])
+    if minutes < 0:
+        raise ValueError("negative timestamp")
+    return minutes + int(seconds_value // 60), seconds_value % 60
 
 
 def is_ttml_content(text: str) -> bool:
@@ -371,7 +436,12 @@ def ttml_to_lrc(ttml_content: str, word_synced: bool = False) -> str:
             begin = elem.get("begin")
             if not begin:
                 continue
-            mm, ss = parse_ttml_time(begin)
+            try:
+                mm, ss = parse_ttml_time(begin)
+            except (TypeError, ValueError):
+                # One malformed cue must not discard the rest of the document.
+                log.debug(f"{PLUGIN_NAME}: skipping TTML cue with invalid begin={begin!r}")
+                continue
             line_ts = f"[{mm:02d}:{ss:05.2f}]"
 
             spans = [
@@ -384,7 +454,10 @@ def ttml_to_lrc(ttml_content: str, word_synced: bool = False) -> str:
                 words = []
                 for s in spans:
                     s_begin = s.get("begin")
-                    s_mm, s_ss = parse_ttml_time(s_begin)
+                    try:
+                        s_mm, s_ss = parse_ttml_time(s_begin)
+                    except (TypeError, ValueError):
+                        continue
                     word_text = "".join(s.itertext())
                     words.append(f"<{s_mm:02d}:{s_ss:05.2f}>{word_text}")
                 text = "".join(words).strip()
@@ -492,6 +565,10 @@ _MAIN_INVOKER = None
 _PROVIDER_HTTP = None
 _LYRICS_STORE = None
 
+# A verified TLS context is expensive to build and safe to reuse for every
+# request; per-request construction only adds latency and failure surface.
+_SSL_CONTEXT = None
+
 
 def _lyrics_store_path() -> str:
     """Return a user-data path, never a path inside the installed plugin."""
@@ -537,17 +614,30 @@ class RateLimiter:
     def interval(self) -> float:
         return self._min_interval
 
-    def acquire(self) -> None:
-        """Blocks until the next request slot is available, then claims it."""
+    def acquire(self, cancel_event: threading.Event | None = None) -> bool:
+        """Waits until the next request slot is available, then claims it.
+
+        The slot is reserved before waiting, so concurrent workers queue behind
+        the reservation instead of sleeping while holding the lock.  When
+        ``cancel_event`` is supplied, a paced wait is abandoned as soon as the
+        event is set; the caller then skips the request entirely.
+        """
         if self._min_interval <= 0:
-            return
+            return not (cancel_event is not None and cancel_event.is_set())
+
         with self._lock:
             now = time.monotonic()
-            wait = self._next_allowed - now
-            if wait > 0:
+            slot = max(now, self._next_allowed)
+            self._next_allowed = slot + self._min_interval
+
+        wait = slot - time.monotonic()
+        if wait > 0:
+            if cancel_event is not None:
+                if cancel_event.wait(wait):
+                    return False
+            else:
                 time.sleep(wait)
-                now = time.monotonic()
-            self._next_allowed = now + self._min_interval
+        return not (cancel_event is not None and cancel_event.is_set())
 
 
 class TTLCache:
@@ -611,8 +701,12 @@ def _init_caches() -> None:
 # ---------------------------------------------------------------------------
 def _get_ssl_context():
     """Returns the verified default SSL context used for HTTPS requests."""
+    global _SSL_CONTEXT
+    if _SSL_CONTEXT is not None:
+        return _SSL_CONTEXT
     try:
-        return create_ssl_context()
+        _SSL_CONTEXT = create_ssl_context()
+        return _SSL_CONTEXT
     except Exception as e:
         log.error(f"{PLUGIN_NAME}: Failed to create a verified SSL context: {e}", exc_info=True)
         raise
@@ -634,6 +728,11 @@ def _http_get(req, timeout: int):
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
+def _wait_for_retry(seconds: float) -> bool:
+    """Waits for a retry backoff, returning ``True`` when shutdown interrupts it."""
+    return _SHUTDOWN_EVENT.wait(max(0.0, float(seconds)))
+
+
 def _http_get_with_retry(req, timeout: int, retries: int = HTTP_RETRIES) -> str | None:
     """Throttled HTTP GET with exponential backoff for transient failures.
 
@@ -647,7 +746,12 @@ def _http_get_with_retry(req, timeout: int, retries: int = HTTP_RETRIES) -> str 
     last_status = None
 
     for attempt in range(retries + 1):
-        _RATE_LIMITER.acquire()
+        if _SHUTDOWN_EVENT.is_set():
+            log.debug(f"{PLUGIN_NAME}: request cancelled by plugin shutdown")
+            return None
+        if not _RATE_LIMITER.acquire(_SHUTDOWN_EVENT):
+            log.debug(f"{PLUGIN_NAME}: paced request cancelled by plugin shutdown")
+            return None
         try:
             status, body = _http_get(req, timeout)
         except HTTPError as e:
@@ -677,7 +781,9 @@ def _http_get_with_retry(req, timeout: int, retries: int = HTTP_RETRIES) -> str 
             f"{'network error' if status is None else f'HTTP {status}'} "
             f"(attempt {attempt + 1}/{retries}, waiting {delay:.2f}s)"
         )
-        time.sleep(delay)
+        if _wait_for_retry(delay):
+            log.debug(f"{PLUGIN_NAME}: retry backoff cancelled by plugin shutdown")
+            return None
 
     if last_error is not None:
         log.warning(f"{PLUGIN_NAME}: request failed for {req.full_url}: {last_error}")
@@ -837,12 +943,13 @@ class MainThreadDispatcher(QtCore.QObject):
     with the number of tracks still waiting in the lyrics queue.
     """
 
-    def __init__(self, poll_ms: int = 100):
+    def __init__(self, poll_ms: int = 100, max_callbacks_per_tick: int = 25):
         super().__init__()
         self._callbacks: "queue.Queue" = queue.Queue()
         self._post_lock = threading.Lock()
         self._stopped = False
         self._last_status: str | None = None
+        self._max_callbacks_per_tick = max(1, int(max_callbacks_per_tick))
         self._timer = None
         try:
             self._timer = QtCore.QTimer(self)
@@ -859,18 +966,27 @@ class MainThreadDispatcher(QtCore.QObject):
                 self._callbacks.put(fn)
 
     def stop(self) -> None:
+        """Stops the timer, drops pending results and clears the status line."""
         with self._post_lock:
+            if self._stopped:
+                return
             self._stopped = True
             while True:
                 try:
                     self._callbacks.get_nowait()
                 except queue.Empty:
                     break
-        try:
-            if self._timer is not None:
-                self._timer.stop()
-        except Exception:
-            pass
+        timer = self._timer
+        self._timer = None
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+            try:
+                timer.deleteLater()
+            except Exception:
+                pass
         try:
             if self._last_status is not None:
                 _clear_status_message()
@@ -879,12 +995,19 @@ class MainThreadDispatcher(QtCore.QObject):
         self._last_status = None
 
     def poll(self) -> None:
-        """Runs pending callbacks, then refreshes the queue status message."""
-        while True:
+        """Runs a bounded batch of pending callbacks, then refreshes status.
+
+        The batch is capped so a burst of thousands of completed lookups cannot
+        monopolise the GUI thread in a single timer tick.  Remaining callbacks
+        are applied on subsequent ticks.
+        """
+        handled = 0
+        while handled < self._max_callbacks_per_tick:
             try:
                 fn = self._callbacks.get_nowait()
             except queue.Empty:
                 break
+            handled += 1
             try:
                 fn()
             except Exception as e:
@@ -923,9 +1046,14 @@ class FetchQueue:
     Stability & anti-abuse features:
       * a configurable, bounded worker pool instead of an unbounded burst,
       * deduplication of identical in-flight jobs (``key``),
-      * graceful start/stop,
+      * graceful, fast start/stop: pending jobs are discarded on stop instead
+        of being drained behind the user's back,
+      * an epoch per start: a worker left over from an earlier enable cycle can
+        never run a job or deliver a result into the current session,
       * results delivered back to the GUI thread via :class:`MainThreadDispatcher`.
     """
+
+    _POLL_INTERVAL = 0.1
 
     def __init__(self, max_workers: int = 3):
         self._max_workers = max(1, int(max_workers))
@@ -936,13 +1064,17 @@ class FetchQueue:
         self._running = False
         self._invoker = None
         self._active = 0
+        self._epoch = 0
+        self._stop_event = threading.Event()
+        self._stop_event.set()
 
     def configure(self, max_workers: int | None = None) -> None:
         if max_workers is not None:
             self._max_workers = max(1, int(max_workers))
 
     def set_invoker(self, invoker) -> None:
-        self._invoker = invoker
+        with self._lock:
+            self._invoker = invoker
 
     @property
     def is_running(self) -> bool:
@@ -969,77 +1101,150 @@ class FetchQueue:
         with self._lock:
             if self._running:
                 return
+            self._stop_event.clear()
+            self._epoch += 1
+            epoch = self._epoch
             self._running = True
             self._workers = [
                 threading.Thread(
                     target=self._worker_loop,
+                    args=(epoch,),
                     name=f"BetterLyricsFetch-{i}",
                     daemon=True,
                 )
                 for i in range(self._max_workers)
             ]
+        started = 0
         for worker in self._workers:
-            worker.start()
-        log.debug(f"{PLUGIN_NAME}: fetch queue started ({self._max_workers} worker(s))")
+            try:
+                worker.start()
+                started += 1
+            except RuntimeError as error:
+                log.warning(f"{PLUGIN_NAME}: could not start fetch worker: {error}")
+        if started == 0:
+            with self._lock:
+                self._running = False
+                self._stop_event.set()
+                self._workers = []
+            log.warning(f"{PLUGIN_NAME}: fetch queue has no usable workers")
+            return
+        log.debug(f"{PLUGIN_NAME}: fetch queue started ({started} worker(s))")
 
-    def stop(self) -> None:
-        """Signals workers to drain the queue and exit, then joins them."""
+    def stop(self, timeout: float = 1.0) -> None:
+        """Stop workers, discard queued jobs and detach stale results.
+
+        Pending work is intentionally *not* drained: on disable the user has
+        already left the session, and finishing hundreds of lookups would keep
+        network traffic and metadata writes alive behind a disabled plugin.
+        Workers finish the request they are already executing (bounded by the
+        HTTP timeout), then exit when they observe the new epoch.
+        """
         with self._lock:
             if not self._running:
+                self._stop_event.set()
+                self._pending_keys.clear()
                 return
             self._running = False
+            self._epoch += 1
+            self._stop_event.set()
             workers = list(self._workers)
             self._workers = []
-        for _ in workers:
-            self._queue.put(None)  # poison pill enqueued after pending work
+
+        dropped = 0
+        while True:
+            try:
+                task = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            dropped += 1
+            self._release_key(getattr(task, "key", None))
+            self._queue.task_done()
+
+        # One shared deadline: three stuck workers must not cost 3 × timeout on
+        # the GUI thread.  Stragglers are daemon threads and epoch-guarded.
+        deadline = time.monotonic() + max(0.0, float(timeout))
         for worker in workers:
-            worker.join(timeout=5.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(remaining)
         with self._lock:
             self._pending_keys.clear()
             self._active = 0
-        log.debug(f"{PLUGIN_NAME}: fetch queue stopped")
+        log.debug(
+            f"{PLUGIN_NAME}: fetch queue stopped ({dropped} pending job(s) discarded)"
+        )
 
     def submit(self, job_fn, apply_fn=None, key=None) -> bool:
-        """Enqueues a job. Returns ``False`` if an identical job is already pending."""
-        if key is not None:
-            with self._lock:
+        """Enqueues a job. Returns ``False`` if the queue is stopped or duplicating."""
+        task = _FetchTask(job_fn, apply_fn, key)
+        with self._lock:
+            if not self._running or self._stop_event.is_set():
+                return False
+            if key is not None:
                 if key in self._pending_keys:
                     return False
                 self._pending_keys.add(key)
-        self._queue.put(_FetchTask(job_fn, apply_fn, key))
+            # Enqueue while holding the lock so a concurrent stop() cannot miss
+            # this task and leave it for the next enable cycle.
+            self._queue.put(task)
         return True
 
-    def _release_key(self, key) -> None:
+    def _release_key(self, key, epoch: int | None = None) -> None:
         if key is None:
             return
         with self._lock:
-            self._pending_keys.discard(key)
+            if epoch is None or epoch == self._epoch:
+                self._pending_keys.discard(key)
 
-    def _worker_loop(self) -> None:
+    def _worker_loop(self, epoch: int) -> None:
         while True:
-            task = self._queue.get()
-            if task is not None:
+            try:
+                task = self._queue.get(timeout=self._POLL_INTERVAL)
+            except queue.Empty:
                 with self._lock:
-                    self._active += 1
+                    if self._stop_event.is_set() or epoch != self._epoch or not self._running:
+                        return
+                continue
+
+            counted = False
             try:
                 if task is None:
                     return
+                with self._lock:
+                    current = (
+                        self._running
+                        and epoch == self._epoch
+                        and not self._stop_event.is_set()
+                    )
+                    if current:
+                        self._active += 1
+                        counted = True
+                if not current:
+                    # This worker belongs to a previous enable cycle.  Never run
+                    # or apply its job against the current Picard session.
+                    return
+
                 try:
                     result = task.job_fn()
                 except Exception as e:
-                    log.warning(f"{PLUGIN_NAME}: background fetch job failed: {e}")
+                    log.warning(
+                        f"{PLUGIN_NAME}: background fetch job failed: {type(e).__name__}"
+                    )
                     result = None
                 if task.apply_fn is not None:
-                    invoker = self._invoker
-                    if invoker is not None:
+                    with self._lock:
+                        invoker = self._invoker
+                        current = epoch == self._epoch and self._running
+                    if current and invoker is not None and not self._stop_event.is_set():
                         invoker.post(partial(task.apply_fn, result))
                     else:
-                        log.debug(f"{PLUGIN_NAME}: no main-thread invoker; result dropped")
+                        log.debug(f"{PLUGIN_NAME}: result dropped (plugin stopped)")
             finally:
-                if task is not None:
+                if counted:
                     with self._lock:
                         self._active = max(0, self._active - 1)
-                self._release_key(getattr(task, "key", None))
+                self._release_key(getattr(task, "key", None), epoch)
                 self._queue.task_done()
 
 
@@ -1304,21 +1509,28 @@ def search_unison(
     search_q = query or f"{artist} {title}".strip() or title
     if search_q:
         data = fetch_json(UNISON_SEARCH_URL, {"q": search_q})
-        if data and isinstance(data, dict) and data.get("success"):
-            for res in data.get("data", []):
+        rows = data.get("data") if isinstance(data, dict) and data.get("success") else None
+        if isinstance(rows, list):
+            for res in rows:
+                if not isinstance(res, dict):
+                    continue
                 c_id = res.get("id")
+                if c_id is None or isinstance(c_id, (dict, list, set)):
+                    continue
                 if c_id in seen_ids:
                     continue
                 seen_ids.add(c_id)
+                sync_type = res.get("syncType", "plain")
+                file_format = res.get("format", "ttml")
                 candidates.append({
                     "id": c_id,
-                    "title": res.get("song", ""),
-                    "artist": res.get("artist", ""),
-                    "album": res.get("album", ""),
+                    "title": res.get("song", "") if isinstance(res.get("song", ""), str) else "",
+                    "artist": res.get("artist", "") if isinstance(res.get("artist", ""), str) else "",
+                    "album": res.get("album", "") if isinstance(res.get("album", ""), str) else "",
                     "duration": res.get("duration", 0),
-                    "isrc": res.get("isrc", ""),
-                    "timing_type": res.get("syncType", "plain"),
-                    "format": res.get("format", "ttml"),
+                    "isrc": res.get("isrc", "") if isinstance(res.get("isrc", ""), str) else "",
+                    "timing_type": sync_type if isinstance(sync_type, str) else "plain",
+                    "format": file_format if isinstance(file_format, str) else "ttml",
                     "source": "Unison",
                     "provider_id": "unison",
                     "metadata_verified": True,
@@ -1327,6 +1539,28 @@ def search_unison(
                 })
 
     return candidates
+
+
+def _call_provider(provider_id: str, callback) -> list[dict]:
+    """Runs one provider without letting its failure cancel the fallback chain.
+
+    A single malformed provider response used to abort the whole search, which
+    also suppressed Unison/LRCLIB fallbacks.  Provider failures are now logged
+    with a bounded type name and treated as an empty result set.
+    """
+    try:
+        found = callback()
+    except Exception as error:
+        log.warning(
+            f"{PLUGIN_NAME}: provider {provider_id} failed: {type(error).__name__}"
+        )
+        return []
+    if found is None:
+        return []
+    if not isinstance(found, list):
+        log.warning(f"{PLUGIN_NAME}: provider {provider_id} returned an invalid result")
+        return []
+    return found
 
 
 def query_all_sources(
@@ -1339,26 +1573,43 @@ def query_all_sources(
     source_preference: str = "all",
     duration_tolerance: int | None = None,
     prefer_synced: bool | None = None,
+    options: dict | None = None,
 ) -> list[dict]:
-    """Queries configured providers and ranks candidates by recording identity."""
+    """Queries configured providers and ranks candidates by recording identity.
+
+    ``options`` is an optional settings snapshot for background workers.  When
+    omitted (interactive GUI search) each value is read from the plugin config.
+    """
     results = []
 
     if duration_tolerance is None:
-        duration_tolerance = _config_int(get_plugin_api(), "betterlyrics_duration_tolerance", 5)
+        if options and options.get("duration_tolerance") is not None:
+            duration_tolerance = int(options["duration_tolerance"])
+        else:
+            duration_tolerance = _config_int(
+                get_plugin_api(), "betterlyrics_duration_tolerance", 5
+            )
     if prefer_synced is None:
-        prefer_synced = bool(config["betterlyrics_prefer_synced"])
+        if options and "prefer_synced" in options:
+            prefer_synced = bool(options["prefer_synced"])
+        else:
+            prefer_synced = bool(config["betterlyrics_prefer_synced"])
 
     pref = source_preference or "all"
     if pref not in ("all", "lrcred", "unison", "lyricsplus", "boidu", "lrclib"):
         pref = "all"
 
     if pref in ("all", "lrcred"):
-        found = search_lrcred(title, artist, album, isrc, query)
+        found = _call_provider(
+            "lrcred", lambda: search_lrcred(title, artist, album, isrc, query)
+        )
         results.extend(found)
         log.info(f"{PLUGIN_NAME}: provider lrcred returned {len(found)} candidate(s)")
 
     if pref in ("all", "unison"):
-        found = search_unison(title, artist, album, duration, query)
+        found = _call_provider(
+            "unison", lambda: search_unison(title, artist, album, duration, query)
+        )
         results.extend(found)
         log.info(f"{PLUGIN_NAME}: provider unison returned {len(found)} candidate(s)")
 
@@ -1370,11 +1621,21 @@ def query_all_sources(
         "isrc": isrc,
         "query": query,
     }
+
+    def option(name: str) -> bool:
+        if options is not None and name in options:
+            return bool(options[name])
+        return bool(config[f"betterlyrics_{name}"])
+
     optional = {
-        "lyricsplus": bool(config["betterlyrics_enable_lyricsplus"]),
-        "boidu": bool(config["betterlyrics_enable_boidu"]),
-        "lrclib": bool(config["betterlyrics_enable_lrclib"]),
+        "lyricsplus": option("enable_lyricsplus"),
+        "boidu": option("enable_boidu"),
+        "lrclib": option("enable_lrclib"),
     }
+    if options is not None and "api_key" in options:
+        api_key = options["api_key"]
+    else:
+        api_key = config["betterlyrics_api_key"]
     requested = list(optional) if pref == "all" else ([pref] if pref in optional else [])
     for provider_id in requested:
         if not optional[provider_id] and pref == "all":
@@ -1383,14 +1644,25 @@ def query_all_sources(
         if _PROVIDER_HTTP is None:
             log.info(f"{PLUGIN_NAME}: provider {provider_id} skipped: client unavailable")
             continue
-        result = search_provider(
-            provider_id,
-            target,
-            _provider_request_json,
-            api_key=config["betterlyrics_api_key"] if provider_id == "boidu" else "",
-        )
+        try:
+            result = search_provider(
+                provider_id,
+                target,
+                _provider_request_json,
+                api_key=api_key if provider_id == "boidu" else "",
+            )
+        except Exception as error:
+            log.warning(
+                f"{PLUGIN_NAME}: provider {provider_id} failed: {type(error).__name__}"
+            )
+            result = {}
+        if not isinstance(result, dict):
+            log.warning(f"{PLUGIN_NAME}: provider {provider_id} returned an invalid result")
+            result = {}
         status = result.get("status")
         found = result.get("candidates", []) if status == "hit" else []
+        if not isinstance(found, list):
+            found = []
         results.extend(found)
         # Provider messages may contain response bodies or credential-bearing
         # URLs. Log bounded status codes and counts instead.
@@ -1650,12 +1922,20 @@ def save_lyrics_to_files(
 
     embedded = False
     for file in file_list:
-        if apply_target(file, _enabled_sidecars(file)):
-            embedded = True
-            if changed_files is not None:
-                changed_files.append(file)
+        try:
+            if apply_target(file, _enabled_sidecars(file)):
+                embedded = True
+                if changed_files is not None:
+                    changed_files.append(file)
+        except Exception as err:
+            # One unreadable/locked file must not discard lyrics for the rest of
+            # the selection or leave the save guard stuck.
+            log.error(f"{PLUGIN_NAME}: Failed to apply lyrics to a file: {err}")
     if track is not None and hasattr(track, "metadata") and (embedded or not file_list):
-        apply_target(track)
+        try:
+            apply_target(track)
+        except Exception as err:
+            log.error(f"{PLUGIN_NAME}: Failed to apply lyrics to track metadata: {err}")
 
     changed = bool(counts["tags"] or counts["sidecars"])
     log.info(
@@ -1918,11 +2198,14 @@ def _find_best_bundle(
     clean_words: bool,
     tolerance: int,
     prefer_synced: bool,
+    options: dict | None = None,
 ) -> dict | None:
     """Worker-thread body: query providers, pick the best match, resolve lyrics.
 
     Pure network work only - never touches Qt/Picard objects, so it is safe to
-    run off the GUI thread.
+    run off the GUI thread.  ``options`` is a snapshot captured on the GUI
+    thread, so provider toggles and credentials are never read from Picard's
+    configuration object off-thread.
     """
     target = {
         "title": title,
@@ -1952,6 +2235,7 @@ def _find_best_bundle(
             source_preference=source_pref,
             duration_tolerance=tolerance,
             prefer_synced=prefer_synced,
+            options=options,
         )
     except Exception as e:
         log.warning(f"{PLUGIN_NAME}: search failed for \"{title}\": {type(e).__name__}")
@@ -2106,17 +2390,33 @@ def fetch_and_apply_lyrics(
         return True
 
     # Automatic flow: enqueue on the background fetch queue (never blocks the UI).
+    if is_plugin_disabled():
+        log.debug(
+            f"{PLUGIN_NAME}: ignored automatic lyrics lookup for \"{title}\": plugin disabled"
+        )
+        return False
     if not _has_writable_lyrics_destination(files, track):
         log.info(
             f"{PLUGIN_NAME}: Skipped lyrics lookup for \"{title}\": "
             "all enabled destinations are protected or no destinations are enabled"
         )
         return False
-    _ensure_queue_ready()
+    if not _ensure_queue_ready():
+        return False
     source_pref = config["betterlyrics_source"]
     clean_words = bool(config["betterlyrics_clean_word_timestamps"])
     tolerance = int(config["betterlyrics_duration_tolerance"])
     prefer_synced = bool(config["betterlyrics_prefer_synced"])
+    # Capture every setting the worker needs here, on the GUI thread.  The
+    # worker must never read Picard's config object while it is being edited.
+    worker_options = {
+        "duration_tolerance": tolerance,
+        "prefer_synced": prefer_synced,
+        "enable_lyricsplus": bool(config["betterlyrics_enable_lyricsplus"]),
+        "enable_boidu": bool(config["betterlyrics_enable_boidu"]),
+        "enable_lrclib": bool(config["betterlyrics_enable_lrclib"]),
+        "api_key": config["betterlyrics_api_key"],
+    }
 
     submitted = FETCH_QUEUE.submit(
         job_fn=partial(
@@ -2130,6 +2430,7 @@ def fetch_and_apply_lyrics(
             clean_words,
             tolerance,
             prefer_synced,
+            worker_options,
         ),
         apply_fn=partial(_apply_auto_bundle, method, title, files, track),
         key=_dedup_key(track, files, method),
@@ -2157,6 +2458,8 @@ def on_file_added(api, track, file=None) -> None:
     if file is None:  # called as (track, file)
         api, track, file = None, api, track
 
+    if is_plugin_disabled():
+        return
     if not config.get("betterlyrics_get_on_load", True):
         return
     try:
@@ -2176,6 +2479,8 @@ def on_file_saved(api, file=None) -> None:
     if file is None:  # called as (file,)
         api, file = None, api
 
+    if is_plugin_disabled():
+        return
     state = files_processing.get(file)
     if state is not None:
         if state == "saving":
@@ -2519,10 +2824,16 @@ class BetterLyricsOptionsPage(OptionsPage):
         self.enable_boidu.setChecked(bool(cfg.get("betterlyrics_enable_boidu", True)))
         self.enable_lrclib.setChecked(bool(cfg.get("betterlyrics_enable_lrclib", True)))
 
-        self.duration_spin.setValue(int(cfg.get("betterlyrics_duration_tolerance", 5)))
+        self.duration_spin.setValue(
+            _bounded_int(cfg.get("betterlyrics_duration_tolerance", 5), 5, 1, 30)
+        )
         self.api_key_input.setText(str(cfg.get("betterlyrics_api_key", "")))
-        self.workers_spin.setValue(int(cfg.get("betterlyrics_max_workers", 3)))
-        self.rate_spin.setValue(int(cfg.get("betterlyrics_rate_limit_ms", 200)))
+        self.workers_spin.setValue(
+            _bounded_int(cfg.get("betterlyrics_max_workers", 3), 3, 1, 8)
+        )
+        self.rate_spin.setValue(
+            _bounded_int(cfg.get("betterlyrics_rate_limit_ms", 200), 200, 0, 5000)
+        )
 
     def save(self):
         # ``config`` writes through to api.plugin_config (persisted) and the
@@ -2573,7 +2884,15 @@ class BetterLyricsOptionsPage(OptionsPage):
 def enable(api: PluginApi) -> None:
     """Entry point called when the plugin is enabled in MusicBrainz Picard 3.0+."""
     global CURRENT_PLUGIN_API, _MAIN_INVOKER, _PROVIDER_HTTP, _LYRICS_STORE
+    global _ENABLED, _DISABLED
+    if _ENABLED and CURRENT_PLUGIN_API is not None:
+        # Picard normally disables before re-enabling.  Ignoring a duplicate
+        # enable keeps threads, timers and context-menu registrations unique.
+        log.warning(f"{PLUGIN_NAME}: enable() called while already enabled; ignoring")
+        return
     CURRENT_PLUGIN_API = api
+    _DISABLED = False
+    _SHUTDOWN_EVENT.clear()
 
     # Picard invokes enable on the GUI thread, before menus can use our actions.
     try:
@@ -2591,12 +2910,19 @@ def enable(api: PluginApi) -> None:
 
     # Prepare the stability layer: caches, request pacer and background queue.
     _init_caches()
-    _RATE_LIMITER.set_interval(_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0)
+    rate_limit = _config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0
+    _RATE_LIMITER.set_interval(rate_limit)
+    try:
+        ssl_context = _get_ssl_context()
+    except Exception:
+        # A rejected/missing CA bundle must not prevent the plugin from loading;
+        # the provider client can still attempt its own verified context.
+        ssl_context = None
     _PROVIDER_HTTP = HttpClient(
         timeout=12.0,
         retries=2,
-        min_interval=_config_int(api, "betterlyrics_rate_limit_ms", 200) / 1000.0,
-        ssl_context=_get_ssl_context(),
+        min_interval=rate_limit,
+        ssl_context=ssl_context,
     )
     try:
         _LYRICS_STORE = LyricsStore(_lyrics_store_path())
@@ -2606,6 +2932,9 @@ def enable(api: PluginApi) -> None:
     FETCH_QUEUE.configure(_config_int(api, "betterlyrics_max_workers", 3))
     if _MAIN_INVOKER is not None:
         _MAIN_INVOKER.stop()
+    # Picard may call enable() from its install/update worker.  The dispatcher
+    # moves itself to the GUI thread before creating its QTimer, so results are
+    # still delivered immediately after an install or update.
     _MAIN_INVOKER = MainThreadDispatcher()
     FETCH_QUEUE.set_invoker(_MAIN_INVOKER)
     FETCH_QUEUE.start()
@@ -2627,11 +2956,24 @@ def enable(api: PluginApi) -> None:
 
     # Register options page in preferences
     api.register_options_page(BetterLyricsOptionsPage)
+    _ENABLED = True
 
 
 def disable() -> None:
-    """Cleanup hook called when the plugin is disabled in Picard 3.0+."""
+    """Cleanup hook called when the plugin is disabled in Picard 3.0+.
+
+    Picard removes ``api.register_*`` registrations automatically; this method
+    only tears down what Picard does not own: worker threads, the GUI callback
+    timer, HTTP clients and the persistent cache.  It must stay fast, because it
+    runs on the GUI thread while Picard is closing the plugin.
+    """
     global CURRENT_PLUGIN_API, _MAIN_INVOKER, _PROVIDER_HTTP, _LYRICS_STORE
+    global _ENABLED, _DISABLED
+    _DISABLED = True
+    _ENABLED = False
+    # Wake any paced/backoff wait in the legacy HTTP path before joining.
+    _SHUTDOWN_EVENT.set()
+
     try:
         uninstall_menu_lifetime_workaround()
     except Exception as error:
@@ -2639,15 +2981,15 @@ def disable() -> None:
             f"{PLUGIN_NAME}: Qt menu lifetime workaround cleanup failed (%s)",
             type(error).__name__,
         )
+
+    # Closing the provider client cancels in-flight provider requests and makes
+    # the queue join below return quickly.
     if _PROVIDER_HTTP is not None:
-        _PROVIDER_HTTP.close()
-        _PROVIDER_HTTP = None
-    if _LYRICS_STORE is not None:
         try:
-            _LYRICS_STORE.close()
-        except Exception:
-            pass
-        _LYRICS_STORE = None
+            _PROVIDER_HTTP.close()
+        except Exception as error:
+            log.warning(f"{PLUGIN_NAME}: provider client cleanup failed: {error}")
+        _PROVIDER_HTTP = None
     if FETCH_QUEUE is not None:
         FETCH_QUEUE.stop()
     if _MAIN_INVOKER is not None:
@@ -2655,6 +2997,12 @@ def disable() -> None:
         _MAIN_INVOKER = None
     if FETCH_QUEUE is not None:
         FETCH_QUEUE.set_invoker(None)
+    if _LYRICS_STORE is not None:
+        try:
+            _LYRICS_STORE.close()
+        except Exception:
+            pass
+        _LYRICS_STORE = None
     if _HTTP_TEXT_CACHE is not None:
         _HTTP_TEXT_CACHE.clear()
     if _JSON_CACHE is not None:

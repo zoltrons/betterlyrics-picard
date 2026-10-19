@@ -28,6 +28,9 @@ class QtCompatLifecycleTests(unittest.TestCase):
         self.dispatcher = Mock()
         replacements = {
             "CURRENT_PLUGIN_API": None,
+            "_ENABLED": False,
+            "_DISABLED": False,
+            "_SHUTDOWN_EVENT": Mock(),
             "_MAIN_INVOKER": None,
             "_PROVIDER_HTTP": None,
             "_LYRICS_STORE": None,

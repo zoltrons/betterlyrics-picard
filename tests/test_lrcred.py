@@ -139,10 +139,11 @@ class HttpRetryTests(unittest.TestCase):
             patcher = patch.object(plugin, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
-        patcher = patch.object(plugin.time, "sleep")
-        self.sleep = patcher.start()
+        patcher = patch.object(plugin, "_wait_for_retry", return_value=False)
+        self.wait = patcher.start()
         self.addCleanup(patcher.stop)
         self.request = Request(f"{BASE}/s/{ISRC}.json")
+
 
     def test_permanent_http_errors_are_not_retried(self):
         for status in (400, 403, 404):
@@ -153,7 +154,7 @@ class HttpRetryTests(unittest.TestCase):
                     self.assertIsNone(plugin._http_get_with_retry(self.request, 10, retries=2))
                 get.assert_called_once()
                 self.assertTrue(body.closed)
-        self.sleep.assert_not_called()
+        self.wait.assert_not_called()
 
     def test_transient_http_and_network_errors_still_retry(self):
         for error in (
@@ -166,7 +167,7 @@ class HttpRetryTests(unittest.TestCase):
             ) as get:
                 self.assertEqual(plugin._http_get_with_retry(self.request, 10, retries=2), "ok")
                 self.assertEqual(get.call_count, 2)
-        self.assertEqual(self.sleep.call_count, 3)
+        self.assertEqual(self.wait.call_count, 3)
 
 
 if __name__ == "__main__":
