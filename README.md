@@ -154,10 +154,15 @@ Real-Qt checks run separately from the stub suite (PyQt6 required):
 
 ```bash
 QT_QPA_PLATFORM=offscreen python tests/qt_menu_smoke.py
+QT_QPA_PLATFORM=offscreen python tests/qt_dispatcher_thread_smoke.py
 # Requires PyInstaller and a local frozen Picard executable:
 QT_QPA_PLATFORM=offscreen python tests/qt_menu_lifetime_smoke.py \
   --picard-binary "/path/to/MusicBrainz Picard.app/Contents/MacOS/picard-run"
 ```
+
+The dispatcher check enables and disables the plugin from a worker thread, the
+same way Picard's asynchronous install and update flows do, and verifies that
+queued results are applied on the GUI thread.
 
 The lifetime check exercises 300 menu/request cycles, cleanup and disable while
 a menu is alive. The optional `--baseline` flag **deliberately crashes an isolated
@@ -176,6 +181,13 @@ Automatic lyric lookups run on a background worker queue instead of the UI threa
 - **Paces requests** with a configurable minimum delay, avoiding burst traffic and API rate limits.
 - **Retries** transient failures (network errors, HTTP 408/425/429/5xx) with jittered exponential backoff.
 - **Caches** successful responses (and briefly caches failures) to reduce repeat lookups.
+- **Stops immediately on disable**: queued jobs are discarded, an already-running request is abandoned at the next cancellation point, and no result from the previous session can be applied after a re-enable. Shutdown no longer waits for retries or a drained queue.
+- **Works immediately after install or update**: Picard runs plugin installation and updates on a worker thread, so `enable()` may not run on the GUI thread. The result dispatcher is moved to the Qt application thread before its timer is created; previously the timer belonged to a worker thread without an event loop and never fired, which made automatic lyrics appear broken until the plugin was toggled off and on.
+- **Isolates providers**: one failing or malformed source (LRC.red, Unison, LyricsPlus, Boidu, LRCLIB) is logged and skipped, so it cannot suppress the remaining fallback chain.
+- **Snapshots settings** on the GUI thread before handing work to a worker, so worker threads never read Picard's configuration object while it is being edited.
+- **Bounds GUI work per tick**: completed lookups are applied in small batches, preventing a burst of hundreds of results from freezing the window.
+
+Malformed TTML cues are skipped individually instead of discarding the whole document, and stored numeric options that are corrupt or out of range are clamped when the options page loads.
 
 While work is outstanding, the number of tracks still waiting is shown in Picard's status bar (e.g. *Better Lyrics: 7 track(s) in lyrics queue...*), so you can see at a glance how much is left.
 

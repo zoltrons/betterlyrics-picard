@@ -84,6 +84,8 @@ verisini kayıpsız dışa aktarmak olmalı.
    Sentetik `Test` + boşluk + `words`, `Test<00:02.00>words` olarak birleşiyor.
 4. `parse_ttml_time("1500ms")` ValueError üretiyor. Zaman biçimleri daha geniş
    ve kontrollü işlenmeli; bozuk tek satır bütün sonucu düşürmemeli.
+   *(2026-10-19: `ms`/`s` birimleri ve ondalık virgül desteklendi; bozuk bir
+   TTML cue'su artık yalnız kendisi atlanarak dönüştürülüyor.)*
 5. `resolve_lyrics_bundle()` içinde KPOE V2 parser'ı ve Boidu/LyricsPlus
    sağlayıcısı yok. Better Lyrics API URL/anahtar alanı tanımlı ama bağlı değil.
 6. `prefer_synced` yalnız eşit metadata skorlarında etki ediyor. Word/line
